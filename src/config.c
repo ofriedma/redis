@@ -3296,6 +3296,22 @@ standardConfig static_configs[] = {
     createSpecialConfig("replicaof", "slaveof", IMMUTABLE_CONFIG | MULTI_ARG_CONFIG, setConfigReplicaOfOption, getConfigReplicaOfOption, rewriteConfigReplicaOfOption, NULL),
     createSpecialConfig("latency-tracking-info-percentiles", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, setConfigLatencyTrackingInfoPercentilesOutputOption, getConfigLatencyTrackingInfoPercentilesOutputOption, rewriteConfigLatencyTrackingInfoPercentilesOutputOption, NULL),
 
+#ifdef HAVE_LIBURING
+    /* io_uring configuration */
+    createBoolConfig("uring-enabled", NULL, IMMUTABLE_CONFIG, server.uring_config.enabled, 0, NULL, NULL),
+    createBoolConfig("uring-sqpoll", NULL, IMMUTABLE_CONFIG, server.uring_config.sqpoll_enabled, 1, NULL, NULL),
+    createIntConfig("uring-sqpoll-cpu", NULL, IMMUTABLE_CONFIG, -1, 1024, server.uring_config.sqpoll_cpu, -1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-sqpoll-idle", NULL, IMMUTABLE_CONFIG, 0, 60000, server.uring_config.sqpoll_idle_ms, 1000, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-sq-entries", NULL, IMMUTABLE_CONFIG, 64, 32768, server.uring_config.sq_entries, 512, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-cq-entries", NULL, IMMUTABLE_CONFIG, 128, 65536, server.uring_config.cq_entries, 1024, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-buffer-ring-size", NULL, IMMUTABLE_CONFIG, 64, 16384, server.uring_config.buffer_ring_size, 1024, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-buffer-size", NULL, IMMUTABLE_CONFIG, 1024, 65536, server.uring_config.buffer_size, 4096, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("uring-batch-submit-size", NULL, IMMUTABLE_CONFIG, 1, 128, server.uring_config.batch_submit_size, 32, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("uring-multishot-accept", NULL, IMMUTABLE_CONFIG, server.uring_config.multishot_accept, 1, NULL, NULL),
+    createBoolConfig("uring-multishot-recv", NULL, IMMUTABLE_CONFIG, server.uring_config.multishot_recv, 1, NULL, NULL),
+    createBoolConfig("uring-linked-ops", NULL, IMMUTABLE_CONFIG, server.uring_config.linked_ops, 1, NULL, NULL),
+#endif
+
     /* NULL Terminator, this is dropped when we convert to the runtime array. */
     {NULL}
 };
