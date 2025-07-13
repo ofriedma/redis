@@ -219,14 +219,34 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
     
     /* Initialize batch submission mutex */
     pthread_mutex_init(&state->batch_lock, NULL);
-    
+
+    /* Initialize buffer pool */
+    #ifndef REDIS_CLI_BUILD
+    int pool_size = server.uring_config.buffer_ring_size > 0 ?
+                    server.uring_config.buffer_ring_size : 1024;
+    int buffer_size = server.uring_config.buffer_size > 0 ?
+                      server.uring_config.buffer_size : 4096;
+    #else
+    int pool_size = 1024;
+    int buffer_size = 4096;
+    #endif
+
+    state->buffer_pool = create_buffer_pool(pool_size, buffer_size);
+    if (!state->buffer_pool) {
+        #ifndef REDIS_CLI_BUILD
+        serverLog(LL_WARNING, "Failed to create io_uring buffer pool");
+        #endif
+        /* Continue without buffer pool - will use regular allocation */
+    }
+
     eventLoop->apidata = state;
 
     #ifndef REDIS_CLI_BUILD
-    serverLog(LL_NOTICE, "io_uring initialized: sq_entries=%d, cq_entries=%d, sqpoll=%s, buffer_ring=%s",
+    serverLog(LL_NOTICE, "io_uring initialized: sq_entries=%d, cq_entries=%d, sqpoll=%s, buffer_ring=%s, buffer_pool=%s",
               state->sq_entries, state->cq_entries,
               state->sqpoll_enabled ? "yes" : "no",
-              state->buffer_ring_enabled ? "yes" : "no");
+              state->buffer_ring_enabled ? "yes" : "no",
+              state->buffer_pool ? "yes" : "no");
     #endif
 
     return 0;
@@ -274,7 +294,12 @@ static void aeApiFree(aeEventLoop *eventLoop) {
     if (state->buffer_ring_enabled) {
         cleanup_buffer_ring(state);
     }
-    
+
+    /* Clean up buffer pool */
+    if (state->buffer_pool) {
+        free_buffer_pool(state->buffer_pool);
+    }
+
     /* Clean up contexts */
     for (int i = 0; i < state->max_contexts; i++) {
         if (state->contexts[i]) {
@@ -746,6 +771,16 @@ static void get_uring_stats(aeApiState *state, char **info) {
         state->stats.ops_completed > 0 ?
             (double)state->stats.total_completion_time_us / state->stats.ops_completed : 0.0,
         (unsigned long)state->stats.max_completion_time_us);
+
+    /* Add buffer pool statistics if available */
+    if (state->buffer_pool) {
+        char *buffer_stats = NULL;
+        get_buffer_pool_stats(state->buffer_pool, &buffer_stats);
+        if (buffer_stats) {
+            *info = sdscatsds(*info, buffer_stats);
+            sdsfree(buffer_stats);
+        }
+    }
     #endif
 }
 
@@ -788,6 +823,223 @@ void aeGetUringStats(aeEventLoop *eventLoop, char **info) {
     if (eventLoop && eventLoop->apidata) {
         get_uring_stats((aeApiState*)eventLoop->apidata, info);
     }
+}
+
+/* ============================= Buffer Pool Management ============================= */
+
+/* Create a new buffer pool with specified size and buffer size */
+uring_buffer_pool *create_buffer_pool(int pool_size, int buffer_size) {
+    if (pool_size <= 0 || buffer_size <= 0) {
+        return NULL;
+    }
+
+    uring_buffer_pool *pool = zmalloc(sizeof(uring_buffer_pool));
+    if (!pool) {
+        return NULL;
+    }
+
+    /* Initialize pool structure */
+    pool->pool_size = pool_size;
+    pool->buffer_size = buffer_size;
+    pool->free_count = pool_size;
+    pool->allocated_count = 0;
+    pool->free_list = NULL;
+
+    /* Initialize statistics */
+    pool->total_allocations = 0;
+    pool->pool_hits = 0;
+    pool->pool_misses = 0;
+    pool->total_deallocations = 0;
+    pool->peak_usage = 0;
+
+    /* Initialize mutex for thread safety */
+    if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+        zfree(pool);
+        return NULL;
+    }
+
+    /* Allocate buffer entries array */
+    pool->entries = zmalloc(sizeof(uring_buffer_entry) * pool_size);
+    if (!pool->entries) {
+        pthread_mutex_destroy(&pool->mutex);
+        zfree(pool);
+        return NULL;
+    }
+
+    /* Initialize buffer entries and build free list */
+    for (int i = 0; i < pool_size; i++) {
+        uring_buffer_entry *entry = &pool->entries[i];
+
+        /* Allocate buffer memory */
+        entry->buffer = zmalloc(buffer_size);
+        if (!entry->buffer) {
+            /* Clean up previously allocated buffers */
+            for (int j = 0; j < i; j++) {
+                zfree(pool->entries[j].buffer);
+            }
+            zfree(pool->entries);
+            pthread_mutex_destroy(&pool->mutex);
+            zfree(pool);
+            return NULL;
+        }
+
+        entry->size = buffer_size;
+        entry->in_use = 0;
+        entry->last_used = 0;
+
+        /* Add to free list */
+        entry->next = pool->free_list;
+        pool->free_list = entry;
+    }
+
+    return pool;
+}
+
+/* Get a buffer from the pool */
+void *get_buffer_from_pool(uring_buffer_pool *pool) {
+    if (!pool) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+
+    pool->total_allocations++;
+
+    /* Check if we have free buffers */
+    if (pool->free_list == NULL) {
+        pool->pool_misses++;
+        pthread_mutex_unlock(&pool->mutex);
+        return NULL;  /* Pool exhausted */
+    }
+
+    /* Get buffer from free list */
+    uring_buffer_entry *entry = pool->free_list;
+    pool->free_list = entry->next;
+
+    entry->in_use = 1;
+    entry->last_used = time(NULL);
+    entry->next = NULL;
+
+    pool->free_count--;
+    pool->allocated_count++;
+    pool->pool_hits++;
+
+    /* Update peak usage */
+    if (pool->allocated_count > pool->peak_usage) {
+        pool->peak_usage = pool->allocated_count;
+    }
+
+    void *buffer = entry->buffer;
+    pthread_mutex_unlock(&pool->mutex);
+
+    return buffer;
+}
+
+/* Return a buffer to the pool */
+void return_buffer_to_pool(uring_buffer_pool *pool, void *buffer) {
+    if (!pool || !buffer) {
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+
+    pool->total_deallocations++;
+
+    /* Find the buffer entry */
+    uring_buffer_entry *entry = NULL;
+    for (int i = 0; i < pool->pool_size; i++) {
+        if (pool->entries[i].buffer == buffer) {
+            entry = &pool->entries[i];
+            break;
+        }
+    }
+
+    if (!entry || !entry->in_use) {
+        /* Buffer not found or already free */
+        pthread_mutex_unlock(&pool->mutex);
+        return;
+    }
+
+    /* Mark as free and add to free list */
+    entry->in_use = 0;
+    entry->next = pool->free_list;
+    pool->free_list = entry;
+
+    pool->free_count++;
+    pool->allocated_count--;
+
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+/* Free the entire buffer pool */
+void free_buffer_pool(uring_buffer_pool *pool) {
+    if (!pool) {
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+
+    /* Free all buffer memory */
+    for (int i = 0; i < pool->pool_size; i++) {
+        if (pool->entries[i].buffer) {
+            zfree(pool->entries[i].buffer);
+        }
+    }
+
+    /* Free entries array */
+    zfree(pool->entries);
+
+    pthread_mutex_unlock(&pool->mutex);
+    pthread_mutex_destroy(&pool->mutex);
+
+    /* Free pool structure */
+    zfree(pool);
+}
+
+/* Get buffer pool statistics */
+void get_buffer_pool_stats(uring_buffer_pool *pool, char **info) {
+    if (!pool || !info) {
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+
+    /* Calculate hit rate */
+    double hit_rate = 0.0;
+    if (pool->total_allocations > 0) {
+        hit_rate = (double)pool->pool_hits / pool->total_allocations * 100.0;
+    }
+
+    /* Calculate utilization */
+    double utilization = (double)pool->allocated_count / pool->pool_size * 100.0;
+
+    /* Format statistics string */
+    *info = sdscatprintf(sdsempty(),
+        "buffer_pool_size:%d\r\n"
+        "buffer_pool_buffer_size:%d\r\n"
+        "buffer_pool_free_count:%d\r\n"
+        "buffer_pool_allocated_count:%d\r\n"
+        "buffer_pool_total_allocations:%llu\r\n"
+        "buffer_pool_hits:%llu\r\n"
+        "buffer_pool_misses:%llu\r\n"
+        "buffer_pool_hit_rate:%.2f\r\n"
+        "buffer_pool_total_deallocations:%llu\r\n"
+        "buffer_pool_peak_usage:%llu\r\n"
+        "buffer_pool_utilization:%.2f\r\n",
+        pool->pool_size,
+        pool->buffer_size,
+        pool->free_count,
+        pool->allocated_count,
+        pool->total_allocations,
+        pool->pool_hits,
+        pool->pool_misses,
+        hit_rate,
+        pool->total_deallocations,
+        pool->peak_usage,
+        utilization
+    );
+
+    pthread_mutex_unlock(&pool->mutex);
 }
 
 #endif /* HAVE_LIBURING */
