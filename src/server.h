@@ -46,6 +46,9 @@ typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
 
 #include "ae.h"      /* Event driven programming library */
+#ifdef HAVE_LIBURING
+#include "ae_uring.h" /* io_uring event loop backend */
+#endif
 #include "sds.h"     /* Dynamic safe strings */
 #include "mstr.h"    /* Immutable strings with optional metadata attached */
 #include "ebuckets.h" /* expiry data structure */
@@ -2311,6 +2314,11 @@ struct redisServer {
     /* Local environment */
     char *locale_collate;
     int dbg_assert_keysizes;       /* Assert keysizes histogram after each command */
+
+    /* io_uring configuration */
+#ifdef HAVE_LIBURING
+    uring_config uring_config;
+#endif
 };
 
 /* we use 6 so that all getKeyResult fits a cacheline */

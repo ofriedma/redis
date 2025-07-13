@@ -279,6 +279,33 @@ ifeq ($(BUILD_WITH_SYSTEMD),yes)
 	FINAL_CFLAGS+= -DHAVE_LIBSYSTEMD
 endif
 
+# Determine io_uring support and/or build preference (defaulting to auto-detection)
+BUILD_WITH_URING=no
+LIBURING_LIBS=-luring
+
+# If 'USE_URING' in the environment is neither "no" nor "yes", try to
+# auto-detect liburing's presence and link accordingly.
+ifneq ($(USE_URING),no)
+	LIBURING_PKGCONFIG := $(shell $(PKG_CONFIG) --exists liburing && echo $$?)
+# If liburing cannot be detected, continue building without support for it
+# (unless a later check tells us otherwise)
+ifeq ($(LIBURING_PKGCONFIG),0)
+	BUILD_WITH_URING=yes
+	LIBURING_LIBS=$(shell $(PKG_CONFIG) --libs liburing)
+endif
+endif
+
+# If 'USE_URING' is set to "yes" use pkg-config if available or fall back to
+# default -luring.
+ifeq ($(USE_URING),yes)
+	BUILD_WITH_URING=yes
+endif
+
+ifeq ($(BUILD_WITH_URING),yes)
+	FINAL_LIBS+=$(LIBURING_LIBS)
+	FINAL_CFLAGS+= -DHAVE_LIBURING
+endif
+
 ifeq ($(MALLOC),tcmalloc)
 	FINAL_CFLAGS+= -DUSE_TCMALLOC
 	FINAL_LIBS+= -ltcmalloc

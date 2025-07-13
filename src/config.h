@@ -48,6 +48,11 @@
 #define HAVE_PROC_SMAPS 1
 #define HAVE_PROC_SOMAXCONN 1
 #define HAVE_PROC_OOM_SCORE_ADJ 1
+
+/* io_uring support detection */
+#ifdef HAVE_LIBURING
+#define HAVE_URING 1
+#endif
 #define HAVE_EVENT_FD 1
 #endif
 
