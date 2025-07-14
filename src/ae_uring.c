@@ -40,14 +40,14 @@
 /* Forward declarations for static functions */
 static int detect_uring_capabilities(void);
 static int setup_sqpoll(aeApiState *state, struct io_uring_params *params);
-static int setup_wakeup_mechanism(aeApiState *state);
+
 static void free_op_context(uring_op_context *ctx);
 static int submit_write_operation(aeApiState *state, int fd, uring_op_context *ctx);
 static int process_completion(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, int *numevents);
 static void handle_read_completion(aeEventLoop *eventLoop, uring_op_context *ctx, int result, int *numevents);
 static void handle_write_completion(aeEventLoop *eventLoop, uring_op_context *ctx, int result, int *numevents);
 static void handle_accept_completion(aeEventLoop *eventLoop, uring_op_context *ctx, int result, int *numevents);
-static void aeWakeEventLoopUring(aeEventLoop *eventLoop);
+
 static void get_uring_stats(aeApiState *state, char **info);
 static const char *uring_op_type_to_string(int op_type);
 static void update_operation_stats(aeApiState *state, uring_op_context *ctx, int result);
@@ -105,39 +105,7 @@ static int setup_sqpoll(aeApiState *state, struct io_uring_params *params) {
     #endif
 }
 
-/* Setup wake-up mechanism for SQPOLL */
-static int setup_wakeup_mechanism(aeApiState *state) {
-    if (!state->sqpoll_enabled) {
-        return 0;
-    }
-    
-    /* Create eventfd for wake-up */
-    state->wakeup_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (state->wakeup_eventfd == -1) {
-        return -1;
-    }
-    
-    /* Create wake-up context */
-    state->wakeup_ctx = create_op_context(state->wakeup_eventfd, URING_OP_WAKEUP, AE_READABLE);
-    if (!state->wakeup_ctx) {
-        close(state->wakeup_eventfd);
-        return -1;
-    }
-    
-    /* Submit persistent read operation for wake-up detection */
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&state->ring);
-    if (!sqe) {
-        free_op_context(state->wakeup_ctx);
-        close(state->wakeup_eventfd);
-        return -1;
-    }
-    
-    io_uring_prep_read(sqe, state->wakeup_eventfd, &state->wakeup_data, 
-                       sizeof(state->wakeup_data), 0);
-    io_uring_sqe_set_data(sqe, state->wakeup_ctx);
-    
-    return 0;
-}
+
 
 /* Create io_uring backend */
 static int aeApiCreate(aeEventLoop *eventLoop) {
@@ -202,15 +170,7 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
         }
     }
     
-    /* Setup wake-up mechanism for SQPOLL */
-    if (state->sqpoll_enabled) {
-        if (setup_wakeup_mechanism(state) < 0) {
-            #ifndef REDIS_CLI_BUILD
-            serverLog(LL_WARNING, "Failed to setup io_uring wake-up mechanism");
-            #endif
-            state->sqpoll_enabled = 0;
-        }
-    }
+
     
     /* Initialize context tracking */
     state->contexts = zmalloc(sizeof(uring_op_context*) * eventLoop->setsize);
@@ -262,13 +222,7 @@ static void aeApiFree(aeEventLoop *eventLoop) {
     aeApiState *state = eventLoop->apidata;
     if (!state) return;
     
-    /* Clean up wake-up mechanism */
-    if (state->wakeup_eventfd != -1) {
-        close(state->wakeup_eventfd);
-    }
-    if (state->wakeup_ctx) {
-        free_op_context(state->wakeup_ctx);
-    }
+
     
     /* Clean up buffer ring */
     if (state->buffer_ring_enabled) {
@@ -603,13 +557,7 @@ static int process_completion(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, 
         case URING_OP_ACCEPT:
             handle_accept_completion(eventLoop, ctx, result, numevents);
             break;
-        case URING_OP_WAKEUP:
-            /* Wake-up event - re-submit for next wake-up */
-            if (result > 0) {
-                state->stats.sqpoll_wakeups++;
-                setup_wakeup_mechanism(state);
-            }
-            break;
+
         default:
             #ifndef REDIS_CLI_BUILD
             serverLog(LL_WARNING, "Unknown io_uring operation type: %d", ctx->op_type);
@@ -699,16 +647,7 @@ static void handle_accept_completion(aeEventLoop *eventLoop, uring_op_context *c
     }
 }
 
-/* Wake up event loop (for SQPOLL) */
-static void aeWakeEventLoopUring(aeEventLoop *eventLoop) {
-    aeApiState *state = eventLoop->apidata;
 
-    if (state->sqpoll_enabled && state->wakeup_eventfd != -1) {
-        uint64_t wake_val = 1;
-        ssize_t ret = write(state->wakeup_eventfd, &wake_val, sizeof(wake_val));
-        (void)ret; /* Suppress unused variable warning */
-    }
-}
 
 /* Forward declaration */
 static const char *aeApiName(void);
@@ -729,7 +668,6 @@ static void get_uring_stats(aeApiState *state, char **info) {
         "uring_ops_failed:%lu\r\n"
         "uring_sq_full_count:%lu\r\n"
         "uring_cq_overflow_count:%lu\r\n"
-        "uring_sqpoll_wakeups:%lu\r\n"
         "uring_avg_completion_time_us:%.2f\r\n"
         "uring_max_completion_time_us:%lu\r\n",
         aeApiName(),
@@ -742,7 +680,7 @@ static void get_uring_stats(aeApiState *state, char **info) {
         (unsigned long)state->stats.ops_failed,
         (unsigned long)state->stats.sq_full_count,
         (unsigned long)state->stats.cq_overflow_count,
-        (unsigned long)state->stats.sqpoll_wakeups,
+
         state->stats.ops_completed > 0 ?
             (double)state->stats.total_completion_time_us / state->stats.ops_completed : 0.0,
         (unsigned long)state->stats.max_completion_time_us);
@@ -757,7 +695,7 @@ static const char *uring_op_type_to_string(int op_type) {
         case URING_OP_ACCEPT: return "accept";
         case URING_OP_RECV: return "recv";
         case URING_OP_SEND: return "send";
-        case URING_OP_WAKEUP: return "wakeup";
+
         default: return "unknown";
     }
 }

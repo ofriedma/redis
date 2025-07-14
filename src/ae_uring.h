@@ -35,7 +35,7 @@ typedef struct list list;
 #define URING_OP_ACCEPT         3
 #define URING_OP_RECV           4
 #define URING_OP_SEND           5
-#define URING_OP_WAKEUP         6
+
 
 /* Configuration defaults */
 #define URING_DEFAULT_SQ_ENTRIES        512
@@ -46,8 +46,7 @@ typedef struct list list;
 #define URING_DEFAULT_SQPOLL_IDLE       1000
 #define URING_MAX_BATCH_SIZE            128
 
-/* Special markers */
-#define WAKEUP_MARKER                   ((void*)0xDEADBEEF)
+
 #define BUFFER_RING_ID                  0
 
 /* Buffer ring for zero-copy operations */
@@ -121,10 +120,7 @@ typedef struct aeApiState {
     int sqpoll_cpu;                     /* CPU for SQPOLL kernel thread */
     int sqpoll_idle_ms;                 /* SQPOLL idle timeout */
     
-    /* Wake-up mechanism */
-    int wakeup_eventfd;                 /* eventfd for waking SQPOLL */
-    uring_op_context *wakeup_ctx;       /* Wake-up operation context */
-    uint64_t wakeup_data;               /* Wake-up data buffer */
+
     
     /* Buffer management */
     uring_buffer_ring buf_ring;         /* Buffer ring for zero-copy */
@@ -149,7 +145,7 @@ typedef struct aeApiState {
         uint64_t max_completion_time_us;
         uint64_t sq_full_count;
         uint64_t cq_overflow_count;
-        uint64_t sqpoll_wakeups;
+
         uint64_t sqpoll_idle_time_us;
         uint64_t buffer_ring_hits;
         uint64_t buffer_ring_misses;
