@@ -13,9 +13,19 @@
 
 #ifdef HAVE_LIBURING
 
+/* Avoid UNUSED macro conflict with liburing */
+#ifdef UNUSED
+#undef UNUSED
+#endif
+
 #include <liburing.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+
+/* Restore Redis UNUSED macro after liburing include */
+#ifndef UNUSED
+#define UNUSED(V) ((void) V)
+#endif
 
 /* Forward declarations */
 struct connection;

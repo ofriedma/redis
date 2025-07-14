@@ -137,7 +137,8 @@ start_server {tags {"uring config"}} {
                 uring-buffer-size uring-batch-submit-size uring-multishot-accept
                 uring-multishot-recv uring-linked-ops
             } {
-                assert_error "*immutable*" {r config set $option [r config get $option]}
+                set current_value [lindex [r config get $option] 1]
+                assert_error "*immutable*" {r config set $option $current_value}
             }
         }
     }
@@ -186,13 +187,18 @@ start_server {tags {"uring config"}} {
 }
 
 # Test configuration loading from redis.conf
-start_server {tags {"uring config file"} overrides {uring-enabled no uring-sqpoll yes}} {
+start_server {tags {"uring config file"} config "test_config.conf"} {
     test {io_uring configuration can be loaded from config file} {
         set info [r info server]
         if {[string match "*uring*" $info]} {
-            # Verify that configuration overrides work
+            # Verify that configuration from file works
+            # These values should match what's in test_config.conf
             assert_equal "no" [lindex [r config get uring-enabled] 1]
             assert_equal "yes" [lindex [r config get uring-sqpoll] 1]
+            assert_equal "1" [lindex [r config get uring-sqpoll-cpu] 1]
+            assert_equal "2000" [lindex [r config get uring-sqpoll-idle] 1]
+            assert_equal "256" [lindex [r config get uring-sq-entries] 1]
+            assert_equal "512" [lindex [r config get uring-cq-entries] 1]
         }
     }
 }

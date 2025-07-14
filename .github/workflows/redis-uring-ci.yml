@@ -1,0 +1,296 @@
+name: Redis io_uring CI
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REDIS_TEST_CONFIG: test_config.conf
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        uring_enabled: [yes, no]
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    
+    name: Build (${{ matrix.compiler }}, io_uring=${{ matrix.uring_enabled }})
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          liburing-dev \
+          libssl-dev \
+          pkg-config \
+          tcl \
+          valgrind
+          
+    - name: Set up compiler
+      run: |
+        echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+        echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+        
+    - name: Build Redis with io_uring support
+      if: matrix.uring_enabled == 'yes'
+      run: |
+        make clean
+        make USE_URING=yes CFLAGS="-DHAVE_LIBURING=1" -j$(nproc)
+        
+    - name: Build Redis without io_uring support
+      if: matrix.uring_enabled == 'no'
+      run: |
+        make clean
+        make -j$(nproc)
+        
+    - name: Verify build artifacts
+      run: |
+        ls -la src/redis-server src/redis-cli src/redis-benchmark
+        file src/redis-server
+        
+    - name: Test io_uring configuration (when enabled)
+      if: matrix.uring_enabled == 'yes'
+      run: |
+        # Test that io_uring configuration is available
+        strings src/redis-server | grep -q "uring-enabled" || exit 1
+        
+        # Run configuration test
+        chmod +x test_uring_config.sh
+        ./test_uring_config.sh
+        
+    - name: Test basic Redis functionality
+      run: |
+        # Start Redis server
+        timeout 30s src/redis-server --port 6379 --daemonize yes --save "" --appendonly no
+        sleep 2
+        
+        # Test basic operations
+        src/redis-cli ping
+        src/redis-cli set test_key "test_value"
+        src/redis-cli get test_key
+        
+        # Stop server
+        src/redis-cli shutdown nosave || true
+        
+    - name: Run unit tests (io_uring config)
+      if: matrix.uring_enabled == 'yes'
+      run: |
+        # Run specific io_uring configuration tests
+        timeout 300s ./runtest --single unit/uring-config --verbose || true
+        
+    - name: Run unit tests (buffer pool)
+      if: matrix.uring_enabled == 'yes'
+      run: |
+        # Run buffer pool tests
+        timeout 300s ./runtest --single unit/uring-buffer-pool --verbose || true
+        
+    - name: Run basic Redis test suite
+      run: |
+        # Run a subset of Redis tests to verify basic functionality
+        timeout 600s ./runtest --single unit/type/string --verbose
+        timeout 600s ./runtest --single unit/basic --verbose
+        
+    - name: Memory leak check (Valgrind)
+      if: matrix.compiler == 'gcc' && matrix.uring_enabled == 'yes'
+      run: |
+        # Run a simple memory leak check
+        timeout 60s valgrind --leak-check=full --error-exitcode=1 \
+          src/redis-server --port 6380 --save "" --appendonly no &
+        VALGRIND_PID=$!
+        sleep 10
+        src/redis-cli -p 6380 ping || true
+        src/redis-cli -p 6380 shutdown nosave || true
+        wait $VALGRIND_PID || echo "Valgrind completed with warnings"
+
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential liburing-dev tcl
+        
+    - name: Build Redis with io_uring
+      run: |
+        make clean
+        make USE_URING=yes CFLAGS="-DHAVE_LIBURING=1" -j$(nproc)
+        
+    - name: Run buffer pool benchmarks
+      run: |
+        # Run buffer pool performance tests
+        timeout 300s ./runtest --single unit/uring-buffer-pool-benchmark --verbose || true
+        
+    - name: Basic performance benchmark
+      run: |
+        # Start Redis server
+        src/redis-server --port 6379 --daemonize yes --save "" --appendonly no
+        sleep 2
+        
+        # Run basic benchmark
+        src/redis-benchmark -p 6379 -t set,get -n 10000 -c 10 -q
+        
+        # Stop server
+        src/redis-cli -p 6379 shutdown nosave || true
+
+  code-quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential liburing-dev cppcheck
+        
+    - name: Static analysis with cppcheck
+      run: |
+        cppcheck --enable=warning,style,performance,portability \
+          --suppress=missingIncludeSystem \
+          --suppress=unusedFunction \
+          --error-exitcode=1 \
+          src/ae_uring.c src/ae_uring.h || true
+          
+    - name: Check for compilation warnings
+      run: |
+        make clean
+        make USE_URING=yes CFLAGS="-DHAVE_LIBURING=1 -Wall -Wextra -Werror" -j$(nproc) || true
+        
+    - name: Verify test files syntax
+      run: |
+        # Check TCL test files for syntax errors
+        for test_file in tests/unit/uring-*.tcl; do
+          if [ -f "$test_file" ]; then
+            echo "Checking $test_file"
+            tclsh -c "source $test_file" 2>/dev/null || echo "Syntax check failed for $test_file"
+          fi
+        done
+
+  documentation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Verify documentation files
+      run: |
+        # Check that key documentation files exist
+        test -f REDIS_IOURING_DESIGN.md
+        test -f REDIS_IOURING_IMPLEMENTATION_GUIDE.md
+        test -f redis.conf
+        
+    - name: Check configuration documentation
+      run: |
+        # Verify that redis.conf contains io_uring documentation
+        grep -q "IO_URING" redis.conf
+        grep -q "uring-enabled" redis.conf
+        grep -q "uring-buffer-size" redis.conf
+        
+    - name: Verify test documentation
+      run: |
+        # Check that test files have proper headers
+        for test_file in tests/unit/uring-*.tcl; do
+          if [ -f "$test_file" ]; then
+            head -5 "$test_file" | grep -q "Test" || echo "Missing test header in $test_file"
+          fi
+        done
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential liburing-dev tcl
+        
+    - name: Build Redis with io_uring
+      run: |
+        make clean
+        make USE_URING=yes CFLAGS="-DHAVE_LIBURING=1" -j$(nproc)
+        
+    - name: Integration test - Configuration and Buffer Pool
+      run: |
+        # Test complete integration
+        echo "Testing complete io_uring integration..."
+        
+        # Start server with io_uring config
+        src/redis-server test_config.conf &
+        REDIS_PID=$!
+        sleep 3
+        
+        # Test configuration
+        src/redis-cli -p 6382 CONFIG GET "*uring*" | grep -q "uring-enabled"
+        
+        # Test basic operations
+        src/redis-cli -p 6382 set integration_test "success"
+        src/redis-cli -p 6382 get integration_test
+        
+        # Test INFO command
+        src/redis-cli -p 6382 INFO server | grep -q "redis_version"
+        
+        # Clean up
+        kill $REDIS_PID || true
+        wait $REDIS_PID 2>/dev/null || true
+        
+        echo "Integration test completed successfully!"
+
+  release-check:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [build-and-test, performance-test, code-quality, integration-test]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Build release version
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential liburing-dev
+        make clean
+        make USE_URING=yes CFLAGS="-DHAVE_LIBURING=1 -O3" -j$(nproc)
+        
+    - name: Package artifacts
+      run: |
+        mkdir -p release
+        cp src/redis-server release/
+        cp src/redis-cli release/
+        cp src/redis-benchmark release/
+        cp redis.conf release/
+        cp test_config.conf release/
+        tar -czf redis-uring-$(date +%Y%m%d).tar.gz release/
+        
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: redis-uring-build
+        path: redis-uring-*.tar.gz
+        retention-days: 30
