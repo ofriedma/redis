@@ -13,9 +13,19 @@
 
 #ifdef HAVE_LIBURING
 
+/* Avoid UNUSED macro conflict with liburing */
+#ifdef UNUSED
+#undef UNUSED
+#endif
+
 #include <liburing.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+
+/* Restore Redis UNUSED macro after liburing include */
+#ifndef UNUSED
+#define UNUSED(V) ((void) V)
+#endif
 
 /* Forward declarations */
 struct connection;
@@ -106,6 +116,35 @@ typedef struct uring_conn_context {
     uint64_t ops_failed;
 } uring_conn_context;
 
+/* Buffer pool entry for efficient memory management */
+typedef struct uring_buffer_entry {
+    void *buffer;                       /* Pointer to the buffer memory */
+    size_t size;                        /* Size of the buffer */
+    int in_use;                         /* 1 if buffer is currently allocated, 0 if free */
+    uint64_t last_used;                 /* Timestamp of last use (for LRU) */
+    struct uring_buffer_entry *next;    /* Next entry in free list */
+} uring_buffer_entry;
+
+/* Buffer pool for managing pre-allocated buffers */
+typedef struct uring_buffer_pool {
+    uring_buffer_entry *entries;        /* Array of buffer entries */
+    uring_buffer_entry *free_list;      /* Head of free buffer list */
+    int pool_size;                      /* Total number of buffers in pool */
+    int buffer_size;                    /* Size of each individual buffer */
+    int free_count;                     /* Number of free buffers */
+    int allocated_count;                /* Number of allocated buffers */
+
+    /* Statistics */
+    uint64_t total_allocations;         /* Total allocation requests */
+    uint64_t pool_hits;                 /* Successful allocations from pool */
+    uint64_t pool_misses;               /* Failed allocations (pool exhausted) */
+    uint64_t total_deallocations;       /* Total deallocation requests */
+    uint64_t peak_usage;                /* Peak number of buffers in use */
+
+    /* Thread safety */
+    pthread_mutex_t mutex;              /* Mutex for thread-safe operations */
+} uring_buffer_pool;
+
 /* Main io_uring state */
 typedef struct aeApiState {
     struct io_uring ring;               /* io_uring instance */
@@ -129,6 +168,7 @@ typedef struct aeApiState {
     /* Buffer management */
     uring_buffer_ring buf_ring;         /* Buffer ring for zero-copy */
     int buffer_ring_enabled;
+    uring_buffer_pool *buffer_pool;     /* Pre-allocated buffer pool */
     
     /* Event tracking */
     uring_op_context **contexts;       /* Operation contexts by FD */
@@ -176,6 +216,13 @@ typedef struct {
 
 /* Public interface functions */
 void aeGetUringStats(aeEventLoop *eventLoop, char **info);
+
+/* Buffer pool management functions */
+uring_buffer_pool *create_buffer_pool(int pool_size, int buffer_size);
+void *get_buffer_from_pool(uring_buffer_pool *pool);
+void return_buffer_to_pool(uring_buffer_pool *pool, void *buffer);
+void free_buffer_pool(uring_buffer_pool *pool);
+void get_buffer_pool_stats(uring_buffer_pool *pool, char **info);
 
 /* Functions needed by socket.c */
 uring_op_context *create_op_context(int fd, int op_type, int mask);
