@@ -790,4 +790,146 @@ void aeGetUringStats(aeEventLoop *eventLoop, char **info) {
     }
 }
 
+/* ============================================================================
+ * Team Member B - Enhanced Connection Management for io_uring
+ * ============================================================================ */
+
+/* Create connection context for io_uring operations */
+static uring_conn_context *create_conn_context(connection *conn) {
+    uring_conn_context *ctx = zmalloc(sizeof(uring_conn_context));
+    if (!ctx) return NULL;
+
+    memset(ctx, 0, sizeof(uring_conn_context));
+    ctx->conn = conn;
+    ctx->pending_ops = 0;
+
+    /* Initialize operation queues */
+    ctx->pending_reads = listCreate();
+    ctx->pending_writes = listCreate();
+
+    if (!ctx->pending_reads || !ctx->pending_writes) {
+        if (ctx->pending_reads) listRelease(ctx->pending_reads);
+        if (ctx->pending_writes) listRelease(ctx->pending_writes);
+        zfree(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+/* Free connection context */
+static void free_conn_context(uring_conn_context *ctx) {
+    if (!ctx) return;
+
+    /* Clean up pending operations */
+    if (ctx->pending_reads) {
+        listRelease(ctx->pending_reads);
+    }
+    if (ctx->pending_writes) {
+        listRelease(ctx->pending_writes);
+    }
+
+    /* Clean up active operations */
+    if (ctx->read_op.ctx) {
+        free_op_context(ctx->read_op.ctx);
+    }
+    if (ctx->write_op.ctx) {
+        free_op_context(ctx->write_op.ctx);
+    }
+
+    zfree(ctx);
+}
+
+/* Enhanced connection setup for io_uring */
+static int setup_uring_connection(connection *conn) {
+    if (!conn) return -1;
+
+    /* Create io_uring specific context */
+    uring_conn_context *uring_ctx = create_conn_context(conn);
+    if (!uring_ctx) return -1;
+
+    /* Store context in connection private data */
+    /* Note: This would require extending the connection structure */
+    /* For now, we'll use a simple approach */
+
+    return 0;
+}
+
+/* Connection optimization for io_uring */
+static void optimize_connection_for_uring(connection *conn) {
+    if (!conn || conn->fd < 0) return;
+
+    /* Set socket options for optimal io_uring performance */
+    int val = 1;
+
+    /* Enable TCP_NODELAY for low latency */
+    setsockopt(conn->fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+
+    /* Set socket buffer sizes for optimal throughput */
+    val = 65536;  /* 64KB */
+    setsockopt(conn->fd, SOL_SOCKET, SO_RCVBUF, &val, sizeof(val));
+    setsockopt(conn->fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val));
+
+    /* Enable SO_REUSEADDR */
+    val = 1;
+    setsockopt(conn->fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+}
+
+/* Enhanced buffer management for connections */
+static void *get_connection_buffer(uring_conn_context *ctx, size_t size) {
+    if (!ctx) return zmalloc(size);
+
+    /* Use buffer pool for optimal performance */
+    void *buffer = get_buffer_from_pool();
+    if (!buffer) {
+        buffer = zmalloc(size);
+    }
+
+    return buffer;
+}
+
+/* Return connection buffer */
+static void return_connection_buffer(uring_conn_context *ctx, void *buffer) {
+    if (!ctx) {
+        zfree(buffer);
+        return;
+    }
+
+    /* Return to buffer pool */
+    return_buffer_to_pool(buffer);
+}
+
+/* Batch operation submission for connections */
+static int submit_batched_operations(aeApiState *state, uring_conn_context *ctx) {
+    if (!state || !ctx) return -1;
+
+    int submitted = 0;
+
+    /* Submit pending read operations */
+    listIter li;
+    listNode *ln;
+    listRewind(ctx->pending_reads, &li);
+
+    while ((ln = listNext(&li)) != NULL) {
+        uring_op_context *op_ctx = listNodeValue(ln);
+        if (submit_read_operation(state, op_ctx->fd, op_ctx) == 0) {
+            submitted++;
+            listDelNode(ctx->pending_reads, ln);
+        }
+    }
+
+    /* Submit pending write operations */
+    listRewind(ctx->pending_writes, &li);
+
+    while ((ln = listNext(&li)) != NULL) {
+        uring_op_context *op_ctx = listNodeValue(ln);
+        if (submit_write_operation(state, op_ctx->fd, op_ctx) == 0) {
+            submitted++;
+            listDelNode(ctx->pending_writes, ln);
+        }
+    }
+
+    return submitted;
+}
+
 #endif /* HAVE_LIBURING */
