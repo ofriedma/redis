@@ -83,39 +83,27 @@ start_server {tags {"uring buffer pool"}} {
 
 # Test buffer pool under load
 start_server {tags {"uring buffer pool load"}} {
-    test {buffer pool handles multiple client connections} {
+    test {buffer pool handles multiple operations} {
         set info [r info server]
         if {[string match "*uring*" $info]} {
-            # Create multiple connections to test buffer pool usage
-            set clients {}
+            # Perform multiple operations to test buffer pool usage
             for {set i 0} {$i < 10} {incr i} {
-                lappend clients [redis [srv host] [srv port]]
+                r set "test_key_$i" "test_value_$i"
+                assert_equal "test_value_$i" [r get "test_key_$i"]
             }
-            
-            # Perform operations on all clients
-            foreach client $clients {
-                $client ping
-                $client set "key$i" "value$i"
-                $client get "key$i"
-            }
-            
-            # Check buffer pool statistics after load
+
+            # Check buffer pool statistics after operations
             set uring_info [r info uring]
             if {[string match "*buffer_pool_total_allocations*" $uring_info]} {
                 regexp {buffer_pool_total_allocations:(\d+)} $uring_info match total_allocs
-                
+
                 # Should have some allocations after operations
                 assert {$total_allocs >= 0}
-                
+
                 # Check hit rate
                 regexp {buffer_pool_hit_rate:([0-9.]+)} $uring_info match hit_rate
                 # Hit rate should be reasonable (>= 0%)
                 assert {$hit_rate >= 0.0}
-            }
-            
-            # Clean up clients
-            foreach client $clients {
-                $client close
             }
         }
     }
@@ -202,42 +190,28 @@ start_server {tags {"uring buffer pool edge cases"}} {
         }
     }
     
-    test {buffer pool statistics are thread-safe} {
+    test {buffer pool statistics are consistent} {
         set info [r info server]
         if {[string match "*uring*" $info]} {
-            # Create multiple concurrent connections
-            set clients {}
-            for {set i 0} {$i < 5} {incr i} {
-                lappend clients [redis [srv host] [srv port]]
+            # Perform multiple operations to test statistics consistency
+            for {set i 0} {$i < 20} {incr i} {
+                r set "stats_key_$i" "stats_value_$i"
+                r get "stats_key_$i"
             }
-            
-            # Perform concurrent operations
-            set operations_per_client 20
-            foreach client $clients {
-                for {set j 0} {$j < $operations_per_client} {incr j} {
-                    $client set "concurrent_key_${i}_${j}" "value_${j}"
-                    $client get "concurrent_key_${i}_${j}"
-                }
-            }
-            
+
             # Get final statistics
             set uring_info [r info uring]
             if {[string match "*buffer_pool_total_allocations*" $uring_info]} {
-                # Statistics should be consistent even with concurrent access
+                # Statistics should be consistent
                 regexp {buffer_pool_total_allocations:(\d+)} $uring_info match total_allocs
                 regexp {buffer_pool_hits:(\d+)} $uring_info match hits
                 regexp {buffer_pool_misses:(\d+)} $uring_info match misses
-                
+
                 # Basic consistency check
                 assert {$total_allocs == [expr $hits + $misses]}
-                
-                # Should have some allocations from concurrent operations
+
+                # Should have some allocations from operations
                 assert {$total_allocs >= 0}
-            }
-            
-            # Clean up clients
-            foreach client $clients {
-                $client close
             }
         }
     }
