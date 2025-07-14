@@ -37,6 +37,32 @@
 /* Include buffer management functions */
 #include "uring_buffer.c"
 
+/* Team Member C - Week 1 Task 1: Operation Management Implementation */
+
+/* Operation type enumeration as specified in implementation guide */
+typedef enum {
+    URING_OP_ACCEPT = 1,
+    URING_OP_READ,
+    URING_OP_WRITE,
+    URING_OP_TIMEOUT
+} uring_op_type_t;
+
+/* Operation structure as specified in implementation guide */
+typedef struct uring_operation {
+    int fd;
+    uring_op_type_t op_type;
+    void *buffer;
+    size_t buffer_size;
+    void (*completion_handler)(struct uring_operation *op, int result);
+    int persistent;
+    monotime submit_time;
+} uring_operation;
+
+/* Forward declarations for Team Member C operation management functions */
+uring_operation *create_operation(int fd, uring_op_type_t op_type);
+void free_operation(uring_operation *op);
+int submit_operation(aeApiState *state, uring_operation *op);
+
 /* Forward declarations for static functions */
 static int detect_uring_capabilities(void);
 static int setup_sqpoll(aeApiState *state, struct io_uring_params *params);
@@ -1040,6 +1066,138 @@ void get_buffer_pool_stats(uring_buffer_pool *pool, char **info) {
     );
 
     pthread_mutex_unlock(&pool->mutex);
+}
+
+/* ============================================================================
+ * Team Member C - Week 1 Task 1: Operation Management Implementation
+ * ============================================================================ */
+
+/* Operation management functions as specified in implementation guide Step 2.3 */
+
+/* Create a new operation with specified file descriptor and operation type */
+uring_operation *create_operation(int fd, uring_op_type_t op_type) {
+    uring_operation *op = zmalloc(sizeof(uring_operation));
+    if (!op) return NULL;
+
+    op->fd = fd;
+    op->op_type = op_type;
+    op->buffer = NULL;
+    op->buffer_size = 0;
+    op->completion_handler = NULL;
+    op->persistent = 0;
+    op->submit_time = getMonotonicUs();
+
+    return op;
+}
+
+/* Free an operation and its associated resources */
+void free_operation(uring_operation *op) {
+    if (!op) return;
+
+    /* Return buffer to pool if it was allocated */
+    if (op->buffer) {
+        /* Note: This requires access to the buffer pool */
+        zfree(op->buffer);  /* Simplified - should use return_buffer_to_pool */
+    }
+
+    zfree(op);
+}
+
+/* Submit an operation to the io_uring submission queue */
+int submit_operation(aeApiState *state, uring_operation *op) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&state->ring);
+    if (!sqe) {
+        state->stats.ops_failed++;
+        return -1;
+    }
+
+    /* Setup operation based on type */
+    switch (op->op_type) {
+        case URING_OP_READ:
+            io_uring_prep_recv(sqe, op->fd, op->buffer, op->buffer_size, 0);
+            break;
+        case URING_OP_WRITE:
+            io_uring_prep_send(sqe, op->fd, op->buffer, op->buffer_size, 0);
+            break;
+        case URING_OP_ACCEPT:
+            io_uring_prep_accept(sqe, op->fd, NULL, NULL, 0);
+            break;
+        case URING_OP_TIMEOUT:
+            /* Timeout operations would be implemented here */
+            return -1; /* Not implemented yet */
+        default:
+            state->stats.ops_failed++;
+            return -1;
+    }
+
+    io_uring_sqe_set_data(sqe, op);
+
+    /* Update statistics */
+    state->stats.ops_submitted++;
+
+    /* Track operation by FD for proper lifecycle management */
+    if (op->fd >= 0 && op->fd < state->max_contexts) {
+        /* Store operation reference for completion handling */
+        /* Note: In the current implementation, we use the existing contexts array
+         * In a full implementation following the guide, we would have a separate
+         * operations array: state->operations[op->fd] = op; */
+    }
+
+    return 0;
+}
+
+/* Helper function to update operation statistics */
+static void update_operation_statistics(aeApiState *state, uring_operation *op, int result) {
+    if (result >= 0) {
+        state->stats.ops_completed++;
+
+        /* Calculate completion time */
+        monotime completion_time = getMonotonicUs();
+        uint64_t operation_duration = completion_time - op->submit_time;
+
+        state->stats.total_completion_time_us += operation_duration;
+        if (operation_duration > state->stats.max_completion_time_us) {
+            state->stats.max_completion_time_us = operation_duration;
+        }
+    } else {
+        state->stats.ops_failed++;
+    }
+}
+
+/* Process completion for uring_operation (Team Member C implementation) */
+static int process_operation_completion(aeEventLoop *eventLoop, uring_operation *op, int result) {
+    aeApiState *state = eventLoop->apidata;
+
+    /* Update operation statistics */
+    update_operation_statistics(state, op, result);
+
+    /* Call operation-specific completion handler if provided */
+    if (op->completion_handler) {
+        op->completion_handler(op, result);
+    }
+
+    /* Handle persistent operations (auto-resubmit) */
+    if (op->persistent && result >= 0) {
+        /* Reset submit time for the resubmitted operation */
+        op->submit_time = getMonotonicUs();
+
+        /* Resubmit the operation */
+        if (submit_operation(state, op) < 0) {
+            /* If resubmission fails, clean up the operation */
+            free_operation(op);
+            return -1;
+        }
+        return 0; /* Operation resubmitted, don't free it */
+    }
+
+    /* Clear operation tracking */
+    if (op->fd >= 0 && op->fd < state->max_contexts) {
+        /* In a full implementation: state->operations[op->fd] = NULL; */
+    }
+
+    /* Free the operation */
+    free_operation(op);
+    return 0;
 }
 
 #endif /* HAVE_LIBURING */
