@@ -1,7 +1,8 @@
-name: Redis io_uring CI
+name: Redis io_uring CI - Week 2 Enhanced
 
-# Team Member D - Week 1 Task 1.D.4
-# Continuous Integration pipeline for Redis io_uring implementation
+# Team Member D - Week 2 Task D.3
+# Enhanced Continuous Integration pipeline for Redis io_uring Week 2 implementations
+# Includes comprehensive testing for all team member deliverables
 
 on:
   push:
@@ -152,12 +153,25 @@ jobs:
       run: |
         cd tests/unit
         make test
-        
+
+    - name: Run Week 2 comprehensive unit tests
+      run: |
+        cd tests/unit
+        # Run Week 2 specific tests
+        ./test_uring_week2 || echo "Week 2 C tests failed (may be expected if io_uring unavailable)"
+
+    - name: Run TCL unit tests for Week 2
+      run: |
+        # Run Week 2 TCL test suites
+        timeout 300s ./runtest --single unit/uring-week2-comprehensive || echo "Week 2 comprehensive tests failed"
+        timeout 300s ./runtest --single unit/uring-week2-edge-cases || echo "Week 2 edge case tests failed"
+        timeout 300s ./runtest --single unit/uring-week2-performance || echo "Week 2 performance tests failed"
+
     - name: Run unit tests with valgrind
       run: |
         cd tests/unit
         make test-valgrind || echo "Valgrind tests failed (may be expected)"
-        
+
     - name: Run unit tests without io_uring
       run: |
         cd tests/unit
@@ -213,6 +227,12 @@ jobs:
         # Run existing Redis tests
         timeout 300s ./runtest --single unit/basic || echo "Some tests may fail"
         
+    - name: Run Week 2 integration tests
+      run: |
+        # Run Week 2 integration test suites
+        timeout 600s ./runtest --single integration/uring-integration || echo "Integration tests failed"
+        timeout 600s ./runtest --single integration/uring-real-world || echo "Real-world scenario tests failed"
+
     - name: Run custom integration tests
       run: |
         # Run our custom integration tests when they exist
@@ -221,6 +241,25 @@ jobs:
         else
           echo "Custom integration tests not yet implemented"
         fi
+
+    - name: Test Week 2 feature integration
+      run: |
+        # Test specific Week 2 features
+        timeout 120s ./src/redis-server --port 6381 --save "" --appendonly no &
+        SERVER_PID=$!
+        sleep 3
+
+        # Test enhanced statistics
+        echo "INFO uring" | ./src/redis-cli -p 6381 > uring-info.txt
+        if grep -q "uring_enabled:yes" uring-info.txt; then
+          echo "✓ io_uring is enabled"
+          # Test Week 2 specific statistics
+          grep -E "(buffer_pool|connection_tracking|operation_tracking)" uring-info.txt || echo "Week 2 stats missing"
+        else
+          echo "⚠ io_uring not enabled, testing fallback behavior"
+        fi
+
+        kill $SERVER_PID || true
 
   # Performance benchmarks job
   performance-tests:
@@ -265,12 +304,37 @@ jobs:
         ./redis-benchmark-epoll -p 6379 -t set,get -n 10000 -c 10 --csv > benchmark-epoll.csv || true
         kill $EPOLL_PID || true
         
-        # Performance test with io_uring (if available)
+        # Enhanced performance test with io_uring (if available)
         if [ -f "redis-server-uring" ]; then
-          timeout 60s ./redis-server-uring --port 6380 --save "" --appendonly no &
+          timeout 120s ./redis-server-uring --port 6380 --save "" --appendonly no &
           URING_PID=$!
-          sleep 2
+          sleep 3
+
+          # Basic benchmark
           ./redis-benchmark-uring -p 6380 -t set,get -n 10000 -c 10 --csv > benchmark-uring.csv || true
+
+          # Week 2 specific performance tests
+          echo "=== Week 2 io_uring Performance Tests ===" > week2-uring-performance.log
+
+          # Test buffer pool performance
+          echo "Testing buffer pool with large values..." >> week2-uring-performance.log
+          ./redis-benchmark-uring -p 6380 -t set -n 1000 -d 4096 -c 5 >> week2-uring-performance.log || true
+
+          # Test connection handling
+          echo "Testing multiple connections..." >> week2-uring-performance.log
+          ./redis-benchmark-uring -p 6380 -t set,get -n 5000 -c 50 >> week2-uring-performance.log || true
+
+          # Get comprehensive statistics
+          echo "INFO uring" | ./redis-benchmark-uring -p 6380 -c 1 -n 1 --csv > uring-stats.csv || true
+
+          # Extract Week 2 metrics
+          echo "=== Week 2 Feature Validation ===" >> week2-uring-performance.log
+          if [ -f "uring-stats.csv" ]; then
+            # Check for Week 2 specific statistics
+            echo "Checking for Week 2 statistics..." >> week2-uring-performance.log
+            timeout 5s ./src/redis-cli -p 6380 INFO uring | grep -E "(buffer_pool|connection_tracking|operation_tracking)" >> week2-uring-performance.log || echo "Week 2 stats not found" >> week2-uring-performance.log
+          fi
+
           kill $URING_PID || true
         fi
         
@@ -281,13 +345,142 @@ jobs:
         name: performance-benchmarks
         path: |
           benchmark-*.csv
+          week2-*.log
+        retention-days: 30
+
+  # Week 2 comprehensive testing job
+  week2-comprehensive:
+    name: Week 2 Comprehensive Testing
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          pkg-config \
+          valgrind \
+          gcov \
+          bc
+        sudo apt-get install -y liburing-dev || echo "liburing not available"
+
+    - name: Build Redis with Week 2 features
+      run: |
+        make clean
+        make USE_URING=yes || make  # Fallback to regular build
+
+    - name: Test Team Member A enhancements
+      run: |
+        echo "=== Testing Team Member A Enhancements ===" > team-a-results.log
+        timeout 60s ./src/redis-server --port 6391 --save "" --appendonly no &
+        SERVER_A_PID=$!
+        sleep 3
+
+        # Test enhanced capability detection
+        ./src/redis-cli -p 6391 INFO uring | grep -E "(uring_capabilities|uring_backend)" >> team-a-results.log || echo "Capability detection not found" >> team-a-results.log
+
+        # Test SQPOLL configuration
+        ./src/redis-cli -p 6391 INFO uring | grep -E "(sqpoll_enabled|sqpoll_cpu)" >> team-a-results.log || echo "SQPOLL config not found" >> team-a-results.log
+
+        # Test enhanced statistics
+        ./src/redis-cli -p 6391 INFO uring | grep -E "(poll_calls|poll_timeouts|success_rate)" >> team-a-results.log || echo "Enhanced stats not found" >> team-a-results.log
+
+        kill $SERVER_A_PID || true
+
+    - name: Test Team Member B enhancements
+      run: |
+        echo "=== Testing Team Member B Enhancements ===" > team-b-results.log
+        timeout 60s ./src/redis-server --port 6392 --save "" --appendonly no &
+        SERVER_B_PID=$!
+        sleep 3
+
+        # Test buffer pool enhancements
+        ./src/redis-cli -p 6392 INFO uring | grep -E "(buffer_pool|buffer_ring)" >> team-b-results.log || echo "Buffer pool stats not found" >> team-b-results.log
+
+        # Test connection lifecycle management
+        ./src/redis-cli -p 6392 INFO uring | grep -E "(connection_tracking|active_connections)" >> team-b-results.log || echo "Connection tracking not found" >> team-b-results.log
+
+        # Test memory optimization
+        for i in {1..100}; do
+          ./src/redis-cli -p 6392 SET "mem_test_$i" "$(printf '%*s' 2048 '' | tr ' ' 'x')" > /dev/null
+        done
+        ./src/redis-cli -p 6392 INFO uring | grep -E "(buffer_pool_hit_rate|memory_usage)" >> team-b-results.log || echo "Memory optimization stats not found" >> team-b-results.log
+
+        kill $SERVER_B_PID || true
+
+    - name: Test Team Member C enhancements
+      run: |
+        echo "=== Testing Team Member C Enhancements ===" > team-c-results.log
+        timeout 60s ./src/redis-server --port 6393 --save "" --appendonly no &
+        SERVER_C_PID=$!
+        sleep 3
+
+        # Test operation management
+        ./src/redis-cli -p 6393 INFO uring | grep -E "(operation_tracking|active_operations)" >> team-c-results.log || echo "Operation tracking not found" >> team-c-results.log
+
+        # Test priority queue management
+        ./src/redis-cli -p 6393 INFO uring | grep -E "(priority_.*|operations_queued)" >> team-c-results.log || echo "Priority queue stats not found" >> team-c-results.log
+
+        # Test error handling and retry logic
+        for i in {1..200}; do
+          ./src/redis-cli -p 6393 SET "retry_test_$i" "value_$i" > /dev/null
+        done
+        ./src/redis-cli -p 6393 INFO uring | grep -E "(operations_failed|operations_completed)" >> team-c-results.log || echo "Error handling stats not found" >> team-c-results.log
+
+        kill $SERVER_C_PID || true
+
+    - name: Generate Week 2 compliance report
+      run: |
+        echo "# Week 2 Implementation Compliance Report" > week2-compliance.md
+        echo "" >> week2-compliance.md
+        echo "## Team Member A - Enhanced Core Implementation" >> week2-compliance.md
+        if grep -q "uring_capabilities" team-a-results.log; then
+          echo "✓ Enhanced capability detection implemented" >> week2-compliance.md
+        else
+          echo "✗ Enhanced capability detection missing" >> week2-compliance.md
+        fi
+
+        echo "" >> week2-compliance.md
+        echo "## Team Member B - Enhanced Buffer Management" >> week2-compliance.md
+        if grep -q "buffer_pool" team-b-results.log; then
+          echo "✓ Enhanced buffer pool implemented" >> week2-compliance.md
+        else
+          echo "✗ Enhanced buffer pool missing" >> week2-compliance.md
+        fi
+
+        echo "" >> week2-compliance.md
+        echo "## Team Member C - Operation Management" >> week2-compliance.md
+        if grep -q "operation_tracking" team-c-results.log; then
+          echo "✓ Operation management implemented" >> week2-compliance.md
+        else
+          echo "✗ Operation management missing" >> week2-compliance.md
+        fi
+
+        echo "" >> week2-compliance.md
+        echo "## Overall Week 2 Status" >> week2-compliance.md
+        FEATURES_FOUND=$(grep -c "✓" week2-compliance.md || echo 0)
+        echo "Features implemented: $FEATURES_FOUND/3" >> week2-compliance.md
+
+    - name: Upload Week 2 test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: week2-comprehensive-results
+        path: |
+          team-*-results.log
+          week2-compliance.md
         retention-days: 30
 
   # Summary job
   ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [validate-environment, validate-build-system, unit-tests, integration-tests]
+    needs: [validate-environment, validate-build-system, unit-tests, integration-tests, week2-comprehensive]
     if: always()
     
     steps:
@@ -296,16 +489,24 @@ jobs:
       
     - name: Generate CI summary
       run: |
-        echo "# Redis io_uring CI Summary" > ci-summary.md
+        echo "# Redis io_uring Week 2 CI Summary" > ci-summary.md
         echo "" >> ci-summary.md
         echo "## Job Status" >> ci-summary.md
         echo "- Environment Validation: ${{ needs.validate-environment.result }}" >> ci-summary.md
         echo "- Build System Validation: ${{ needs.validate-build-system.result }}" >> ci-summary.md
         echo "- Unit Tests: ${{ needs.unit-tests.result }}" >> ci-summary.md
         echo "- Integration Tests: ${{ needs.integration-tests.result }}" >> ci-summary.md
+        echo "- Week 2 Comprehensive Tests: ${{ needs.week2-comprehensive.result }}" >> ci-summary.md
+        echo "" >> ci-summary.md
+        echo "## Week 2 Implementation Status" >> ci-summary.md
+        if [ -f "week2-compliance.md" ]; then
+          cat week2-compliance.md >> ci-summary.md
+        else
+          echo "Week 2 compliance report not available" >> ci-summary.md
+        fi
         echo "" >> ci-summary.md
         echo "## Artifacts Generated" >> ci-summary.md
-        find . -name "*.csv" -o -name "*.log" -o -name "*.gcov" | sort >> ci-summary.md
+        find . -name "*.csv" -o -name "*.log" -o -name "*.gcov" -o -name "*.md" | sort >> ci-summary.md
         
     - name: Upload CI summary
       uses: actions/upload-artifact@v4

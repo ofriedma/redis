@@ -603,6 +603,11 @@ start_server {tags {"introspection"}} {
             req-res-logfile
             client-default-resp
             vset-force-single-threaded-execution
+            uring-enabled
+            uring-sqpoll
+            uring-sq-entries
+            uring-cq-entries
+            uring-buffer-ring-size
         }
 
         if {!$::tls} {
