@@ -5784,7 +5784,11 @@ void releaseInfoSectionDict(dict *sec) {
 dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, int *out_everything) {
     char *default_sections[] = {
         "server", "clients", "memory", "persistence", "stats", "replication", "threads",
-        "cpu", "module_list", "errorstats", "cluster", "keyspace", "keysizes", NULL};
+        "cpu", "module_list", "errorstats", "cluster", "keyspace", "keysizes",
+        #ifdef HAVE_LIBURING
+        "uring",
+        #endif
+        NULL};
     if (!defaults)
         defaults = default_sections;
 
@@ -6399,6 +6403,14 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             (long)m_ru.ru_utime.tv_sec, (long)m_ru.ru_utime.tv_usec);
 #endif  /* RUSAGE_THREAD */
     }
+
+    /* io_uring */
+    #ifdef HAVE_LIBURING
+    if (all_sections || (dictFind(section_dict,"uring") != NULL) || (dictFind(section_dict,"io_uring") != NULL)) {
+        if (sections++) info = sdscat(info,"\r\n");
+        aeGetUringStats(server.el, &info);
+    }
+    #endif
 
     /* Modules */
     if (all_sections || (dictFind(section_dict,"module_list") != NULL) || (dictFind(section_dict,"modules") != NULL)) {
