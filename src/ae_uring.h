@@ -14,6 +14,11 @@
 #ifdef HAVE_LIBURING
 
 #include <liburing.h>
+
+/* Resolve UNUSED macro conflict between Redis and liburing */
+#ifdef UNUSED
+#undef UNUSED
+#endif
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 
@@ -123,6 +128,10 @@ typedef struct uring_op_context {
         int retry_count;
         monotime last_attempt;
     } read_op, write_op, accept_op;
+
+    /* Accept operation specific data */
+    struct sockaddr_storage client_addr;
+    socklen_t client_addr_len;
 
     /* Error handling */
     int last_error;
@@ -287,8 +296,8 @@ typedef struct aeApiState {
         /* Performance metrics */
         uint64_t batch_submissions;
         uint64_t single_submissions;
-        uint64_t poll_calls;
-        uint64_t poll_timeouts;
+        uint64_t completion_batches;
+        uint64_t completion_processing_calls;
 
         /* Memory usage */
         uint64_t buffer_allocations;

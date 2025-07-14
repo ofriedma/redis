@@ -384,7 +384,7 @@ int init_buffer_pool(int count, int size) {
         if (!global_buffer_pool->buffers[i]) {
             /* Clean up allocated buffers */
             for (int j = 0; j < i; j++) {
-                free(global_buffer_pool->buffers[j]); /* Use free for aligned memory */
+                zfree(global_buffer_pool->buffers[j]); /* Use zfree for aligned memory */
             }
             cleanup_buffer_pool();
             return -1;
@@ -517,7 +517,7 @@ void *get_buffer_from_pool_sized(size_t size) {
 /* Enhanced return buffer to pool */
 void return_buffer_to_pool(void *buffer) {
     if (!global_buffer_pool || !buffer) {
-        if (buffer) free(buffer); /* Use free for aligned memory */
+        if (buffer) zfree(buffer); /* Use zfree for aligned memory */
         return;
     }
 
@@ -555,7 +555,7 @@ void return_buffer_to_pool(void *buffer) {
     global_buffer_pool->stats.total_freed_bytes += 0; /* We don't know the size */
     pthread_mutex_unlock(&global_buffer_pool->lock);
 
-    free(buffer); /* Use free for aligned memory */
+    zfree(buffer); /* Use zfree for aligned memory */
 }
 
 /* Enhanced cleanup buffer pool */
@@ -576,7 +576,7 @@ void cleanup_buffer_pool(void) {
     if (global_buffer_pool->buffers) {
         for (int i = 0; i < global_buffer_pool->count; i++) {
             if (global_buffer_pool->buffers[i]) {
-                free(global_buffer_pool->buffers[i]); /* Use free for aligned memory */
+                zfree(global_buffer_pool->buffers[i]); /* Use zfree for aligned memory */
             }
         }
         zfree(global_buffer_pool->buffers);
@@ -593,7 +593,7 @@ void cleanup_buffer_pool(void) {
             if (pool->buffers) {
                 for (int j = 0; j < pool->count; j++) {
                     if (pool->buffers[j]) {
-                        free(pool->buffers[j]);
+                        zfree(pool->buffers[j]);
                     }
                 }
                 zfree(pool->buffers);
@@ -736,7 +736,7 @@ static int shrink_buffer_pool(buffer_pool *pool, int target_count) {
     /* Free buffers from the end, but only if they're available */
     for (int i = pool->count - 1; i >= target_count && i >= 0; i--) {
         if (pool->available[i] && pool->buffers[i]) {
-            free(pool->buffers[i]);
+            zfree(pool->buffers[i]);
             pool->buffers[i] = NULL;
             pool->available[i] = 0;
             removed_count++;
@@ -809,7 +809,7 @@ void optimize_buffer_pool(void) {
 
                     for (int j = pool->count - 1; j >= target_size; j--) {
                         if (pool->available[j] && pool->buffers[j]) {
-                            free(pool->buffers[j]);
+                            zfree(pool->buffers[j]);
                             pool->buffers[j] = NULL;
                             pool->available[j] = 0;
                         }
@@ -869,6 +869,7 @@ void monitor_memory_usage(void) {
                    (global_buffer_pool->stats.hits + global_buffer_pool->stats.misses) * 100.0;
     }
 
+    #ifndef REDIS_CLI_BUILD
     serverLog(LL_DEBUG, "Buffer pool memory usage: current=%zu bytes, hit_rate=%.2f%%, "
               "allocations=%lu, deallocations=%lu, grows=%lu, shrinks=%lu",
               current_usage, hit_rate,
@@ -876,6 +877,7 @@ void monitor_memory_usage(void) {
               (unsigned long)global_buffer_pool->stats.deallocations,
               (unsigned long)global_buffer_pool->stats.grows,
               (unsigned long)global_buffer_pool->stats.shrinks);
+    #endif
 
     pthread_mutex_unlock(&global_buffer_pool->lock);
     #endif

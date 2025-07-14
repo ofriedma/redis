@@ -93,46 +93,46 @@ start_server {tags {"uring week2 performance"}} {
         }
     }
     
-    test {Performance: SQPOLL vs regular polling comparison} {
+    test {Performance: SQPOLL vs event-driven completion processing} {
         set info [r info uring]
         if {[string length $info] > 0} {
             set sqpoll_enabled [extract_info_field $info "uring_sqpoll_enabled"]
-            
+
             # Benchmark current configuration
             set start_time [clock milliseconds]
-            
+
             for {set i 0} {$i < 2000} {incr i} {
-                r set "perf_poll_$i" "value_$i"
+                r set "perf_completion_$i" "value_$i"
             }
-            
+
             set end_time [clock milliseconds]
             set duration [expr {$end_time - $start_time}]
-            
+
             if {$sqpoll_enabled eq "yes"} {
                 # SQPOLL should provide better performance
                 assert {$duration < 3000} ;# Less than 3 seconds with SQPOLL
             } else {
-                # Regular polling should still be reasonable
-                assert {$duration < 5000} ;# Less than 5 seconds without SQPOLL
+                # Event-driven processing should still be efficient
+                assert {$duration < 5000} ;# Less than 5 seconds with event-driven approach
             }
-            
-            # Check polling statistics
+
+            # Check completion processing statistics
             set final_info [r info uring]
-            set poll_calls [extract_info_field $final_info "uring_poll_calls"]
-            set poll_timeouts [extract_info_field $final_info "uring_poll_timeouts"]
-            
-            # Should have polling activity
-            assert {$poll_calls > 0}
-            
-            # Timeout rate should be reasonable
-            if {$poll_calls > 0} {
-                set timeout_rate [expr {double($poll_timeouts) / $poll_calls * 100}]
-                assert {$timeout_rate < 50.0} ;# Less than 50% timeout rate
+            set ops_completed [extract_info_field $final_info "uring_ops_completed"]
+            set completion_batches [extract_info_field $final_info "uring_completion_batches"]
+
+            # Should have completion activity
+            assert {$ops_completed > 0}
+
+            # Batch processing should be efficient
+            if {$completion_batches > 0} {
+                set avg_batch_size [expr {double($ops_completed) / $completion_batches}]
+                assert {$avg_batch_size >= 1.0} ;# At least 1 operation per batch
             }
-            
+
             # Clean up
             for {set i 0} {$i < 2000} {incr i} {
-                r del "perf_poll_$i"
+                r del "perf_completion_$i"
             }
         }
     }

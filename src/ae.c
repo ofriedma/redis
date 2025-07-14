@@ -503,7 +503,7 @@ void aeMain(aeEventLoop *eventLoop) {
 }
 
 char *aeGetApiName(void) {
-    return aeApiName();
+    return (char *)aeApiName();
 }
 
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep) {

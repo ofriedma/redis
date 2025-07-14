@@ -33,23 +33,25 @@ start_server {tags {"uring week2 comprehensive"}} {
         }
     }
     
-    test {Team Member A - Enhanced Core Implementation: Improved polling with timeout handling} {
+    test {Team Member A - Enhanced Core Implementation: Event-driven completion processing} {
         set info [r info uring]
         if {[string length $info] > 0} {
-            # Test that polling statistics are tracked
-            assert {[string match "*uring_poll_calls*" $info]}
-            assert {[string match "*uring_poll_timeouts*" $info]}
-            
-            # Perform operations to trigger polling
+            # Test that completion processing statistics are tracked
+            assert {[string match "*uring_ops_completed*" $info]}
+            assert {[string match "*completion_batches*" $info]}
+
+            # Perform operations to trigger completion processing
             for {set i 0} {$i < 5} {incr i} {
-                r set "poll_test_$i" "value_$i"
-                r get "poll_test_$i"
+                r set "completion_test_$i" "value_$i"
+                r get "completion_test_$i"
             }
-            
-            # Check that poll calls increased
+
+            # Check that operations were completed
             set new_info [r info uring]
-            set poll_calls [extract_info_field $new_info "uring_poll_calls"]
-            assert {$poll_calls > 0}
+            set ops_completed [extract_info_field $new_info "uring_ops_completed"]
+            set completion_batches [extract_info_field $new_info "uring_completion_batches"]
+            assert {$ops_completed > 0}
+            assert {$completion_batches > 0}
         }
     }
     

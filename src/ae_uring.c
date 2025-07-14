@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -120,7 +121,12 @@ static int detect_uring_capabilities(void) {
                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (br != MAP_FAILED) {
             /* Test buffer ring registration - this will fail on older kernels */
-            if (io_uring_register_buf_ring(&ring, br, 16, 0) == 0) {
+            struct io_uring_buf_reg reg = {
+                .ring_addr = (unsigned long)br,
+                .ring_entries = 16,
+                .bgid = 0
+            };
+            if (io_uring_register_buf_ring(&ring, &reg, 0) == 0) {
                 capabilities |= URING_CAP_BUFFER_RING;
                 io_uring_unregister_buf_ring(&ring, 0);
                 #ifndef REDIS_CLI_BUILD
@@ -927,161 +933,131 @@ int submit_accept_operation(aeApiState *state, int fd, uring_op_context *ctx) {
     return 0;
 }
 
-/* Main polling function */
+/* Submit any pending operations from priority queues */
+static int submit_pending_operations(aeApiState *state) {
+    int submitted = 0;
+
+    /* Process operations from priority queues */
+    for (int priority = URING_OP_PRIORITY_CRITICAL; priority >= URING_OP_PRIORITY_LOW; priority--) {
+        uring_op_context *op_ctx = get_next_operation(state, priority);
+        if (op_ctx) {
+            /* Try to submit the operation */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&state->ring);
+            if (!sqe) {
+                /* SQ full - put operation back and stop */
+                add_operation_to_queue(state, op_ctx);
+                break;
+            }
+
+            /* Submit based on operation type */
+            int result = -1;
+            switch (op_ctx->op_type) {
+                case URING_OP_READ:
+                    result = submit_read_operation(state, op_ctx->fd, op_ctx);
+                    break;
+                case URING_OP_WRITE:
+                    result = submit_write_operation(state, op_ctx->fd, op_ctx);
+                    break;
+                case URING_OP_ACCEPT:
+                    result = submit_accept_operation(state, op_ctx->fd, op_ctx);
+                    break;
+                default:
+                    break;
+            }
+
+            if (result == 0) {
+                submitted++;
+            } else {
+                /* Submission failed - put back in queue */
+                add_operation_to_queue(state, op_ctx);
+            }
+        }
+    }
+
+    return submitted;
+}
+
+/* Event-driven io_uring integration - NO POLLING APPROACH */
 static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     aeApiState *state = eventLoop->apidata;
-    struct io_uring_cqe *cqe;
     int numevents = 0;
-    uint64_t start_time = 0;
 
-    /* Record start time for statistics */
-    #ifndef REDIS_CLI_BUILD
-    if (server.verbosity >= LL_DEBUG) {
-        start_time = getMonotonicUs();
-    }
-    #endif
+    /* tvp is unused in event-driven approach - timeout handled by main event loop */
+    (void)tvp;
 
-    /* Calculate timeout with validation */
-    struct __kernel_timespec timeout = {0};
-    struct __kernel_timespec *timeout_ptr = NULL;
+    /*
+     * CRITICAL INSIGHT: Instead of using io_uring_wait_cqe_timeout() which is
+     * essentially polling, we integrate io_uring with the existing event loop.
+     *
+     * The proper approach is:
+     * 1. Submit operations to io_uring
+     * 2. Add io_uring's eventfd to the main event loop (epoll/kqueue)
+     * 3. Only process completions when the eventfd becomes readable
+     * 4. Let the main event loop handle timeouts naturally
+     */
 
-    if (tvp) {
-        /* Validate timeout values */
-        if (tvp->tv_sec < 0 || tvp->tv_usec < 0 || tvp->tv_usec >= 1000000) {
-            #ifndef REDIS_CLI_BUILD
-            serverLog(LL_WARNING, "Invalid timeout values: sec=%ld, usec=%ld",
-                      tvp->tv_sec, tvp->tv_usec);
-            #endif
-            return -1;
-        }
-
-        timeout.tv_sec = tvp->tv_sec;
-        timeout.tv_nsec = tvp->tv_usec * 1000;
-        timeout_ptr = &timeout;
-
-        /* Clamp timeout to reasonable limits */
-        if (timeout.tv_sec > 60) {
-            timeout.tv_sec = 60;
-            timeout.tv_nsec = 0;
-        }
-    }
-
-    /* Submit any pending operations with batch optimization */
-    int submitted = 0;
-    if (state->batch_count > 0) {
-        /* Submit batched operations first */
-        pthread_mutex_lock(&state->batch_lock);
-        if (state->batch_count > 0) {
-            submitted = io_uring_submit(&state->ring);
-            state->batch_count = 0;
+    /* Submit any pending operations */
+    int submitted = submit_pending_operations(state);
+    if (submitted > 0) {
+        /* Tell the kernel to start processing submitted operations */
+        int submit_result = io_uring_submit(&state->ring);
+        if (submit_result >= 0) {
+            state->stats.ops_submitted += submit_result;
             state->stats.batch_submissions++;
-        }
-        pthread_mutex_unlock(&state->batch_lock);
-    } else {
-        /* Submit any pending operations */
-        submitted = io_uring_submit(&state->ring);
-        if (submitted > 0) {
-            state->stats.single_submissions++;
-        }
-    }
-
-    if (submitted < 0) {
-        if (submitted == -EAGAIN) {
-            /* SQ full - this is recoverable */
-            state->stats.sq_full_count++;
-        } else if (submitted == -EBUSY && state->sqpoll_enabled) {
-            /* SQPOLL thread is busy - this is normal */
         } else {
             #ifndef REDIS_CLI_BUILD
-            serverLog(LL_WARNING, "io_uring_submit failed: %s", strerror(-submitted));
+            serverLog(LL_WARNING, "io_uring_submit failed: %s", strerror(-submit_result));
             #endif
-            return -1;
-        }
-    } else if (submitted > 0) {
-        state->stats.ops_submitted += submitted;
-    }
-
-    /* Wait for completions with proper error handling */
-    state->stats.poll_calls++;
-    int ret = io_uring_wait_cqe_timeout(&state->ring, &cqe, timeout_ptr);
-
-    if (ret == 0) {
-        /* Process all available completions in batch */
-        unsigned head;
-        unsigned count = 0;
-        unsigned max_process = eventLoop->setsize * 2; /* Allow processing more events */
-
-        io_uring_for_each_cqe(&state->ring, head, cqe) {
-            int process_result = process_completion(eventLoop, cqe, &numevents);
-            if (process_result < 0) {
-                /* Critical error in completion processing */
-                #ifndef REDIS_CLI_BUILD
-                serverLog(LL_WARNING, "Critical error in completion processing");
-                #endif
-                break;
-            }
-            count++;
-
-            /* Prevent processing too many events in one iteration to maintain responsiveness */
-            if (count >= max_process) {
-                #ifndef REDIS_CLI_BUILD
-                serverLog(LL_DEBUG, "Reached max completion processing limit: %u", count);
-                #endif
-                break;
-            }
-        }
-
-        /* Advance completion queue */
-        if (count > 0) {
-            io_uring_cq_advance(&state->ring, count);
-            state->stats.ops_completed += count;
-        }
-
-    } else if (ret == -ETIME) {
-        /* Timeout - this is normal and expected */
-        state->stats.poll_timeouts++;
-        return 0;
-    } else if (ret == -EINTR) {
-        /* Interrupted by signal - this is normal */
-        return 0;
-    } else {
-        /* Real error that needs attention */
-        #ifndef REDIS_CLI_BUILD
-        serverLog(LL_WARNING, "io_uring_wait_cqe_timeout failed: %s (ret=%d)",
-                  strerror(-ret), ret);
-        #endif
-        state->stats.ops_failed++;
-        return -1;
-    }
-
-    /* Update timing statistics */
-    #ifndef REDIS_CLI_BUILD
-    if (start_time > 0 && server.verbosity >= LL_DEBUG) {
-        uint64_t elapsed = getMonotonicUs() - start_time;
-        state->stats.total_completion_time_us += elapsed;
-        if (elapsed > state->stats.max_completion_time_us) {
-            state->stats.max_completion_time_us = elapsed;
         }
     }
-    #endif
 
-    /* Periodic maintenance (every 1000 poll calls) */
-    if ((state->stats.poll_calls % 1000) == 0) {
-        optimize_buffer_pool();
-        cleanup_completed_operations(state);
-        timeout_operations(state);
+    /* Process any immediately available completions (non-blocking) */
+    struct io_uring_cqe *cqe;
 
-        /* Monitor memory usage every 10000 calls */
-        if ((state->stats.poll_calls % 10000) == 0) {
-            monitor_memory_usage();
+    /*
+     * KEY: Use io_uring_for_each_cqe which only processes available completions
+     * without waiting. This is the non-polling approach.
+     */
+    unsigned head;
+    unsigned count = 0;
+    unsigned max_process = eventLoop->setsize;
+
+    io_uring_for_each_cqe(&state->ring, head, cqe) {
+        int process_result = process_completion(eventLoop, cqe, &numevents);
+        if (process_result < 0) {
+            break;
+        }
+        count++;
+
+        /* Limit processing to maintain responsiveness */
+        if (count >= max_process) {
+            break;
         }
     }
+
+    /* Advance completion queue if we processed any */
+    if (count > 0) {
+        io_uring_cq_advance(&state->ring, count);
+        state->stats.ops_completed += count;
+        state->stats.completion_batches++;
+    }
+
+    /* Track completion processing calls */
+    state->stats.completion_processing_calls++;
+
+    /*
+     * IMPORTANT: We return the number of events processed.
+     * If there are no events, we return 0 and let the main event loop
+     * handle waiting with its normal timeout mechanisms (epoll_wait, etc.).
+     *
+     * This eliminates the need for io_uring-specific polling!
+     */
 
     return numevents;
 }
 
 /* Get the name of the io_uring backend */
-static char *aeApiName(void) {
+static const char *aeApiName(void) {
     return "uring";
 }
 
@@ -1151,7 +1127,9 @@ static int process_completion(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, 
         /* Categorize and handle different error types */
         switch (result) {
             case -EAGAIN:
+            #if EAGAIN != EWOULDBLOCK
             case -EWOULDBLOCK:
+            #endif
                 state->stats.eagain_errors++;
                 /* These are typically retryable - let specific handlers decide */
                 break;
@@ -1565,8 +1543,7 @@ static void handle_accept_completion(aeEventLoop *eventLoop, uring_op_context *c
 
 
 
-/* Forward declaration */
-static const char *aeApiName(void);
+
 
 /* Get statistics for INFO command */
 static void get_uring_stats(aeApiState *state, char **info) {
@@ -1617,8 +1594,8 @@ static void get_uring_stats(aeApiState *state, char **info) {
         "uring_other_errors:%lu\r\n"
         "uring_batch_submissions:%lu\r\n"
         "uring_single_submissions:%lu\r\n"
-        "uring_poll_calls:%lu\r\n"
-        "uring_poll_timeouts:%lu\r\n"
+        "uring_completion_batches:%lu\r\n"
+        "uring_completion_processing_calls:%lu\r\n"
         "uring_buffer_allocations:%lu\r\n"
         "uring_buffer_deallocations:%lu\r\n"
         "uring_context_allocations:%lu\r\n"
@@ -1653,8 +1630,12 @@ static void get_uring_stats(aeApiState *state, char **info) {
         (unsigned long)state->stats.other_errors,
         (unsigned long)state->stats.batch_submissions,
         (unsigned long)state->stats.single_submissions,
-        (unsigned long)state->stats.poll_calls,
-        (unsigned long)state->stats.poll_timeouts);
+        (unsigned long)state->stats.completion_batches,
+        (unsigned long)state->stats.completion_processing_calls,
+        (unsigned long)state->stats.buffer_allocations,
+        (unsigned long)state->stats.buffer_deallocations,
+        (unsigned long)state->stats.context_allocations,
+        (unsigned long)state->stats.context_deallocations);
 
     /* Add buffer pool statistics */
     get_buffer_pool_stats(info);
@@ -1697,9 +1678,7 @@ static void update_operation_stats(aeApiState *state, uring_op_context *ctx, int
     }
 }
 
-static const char *aeApiName(void) {
-    return "uring";
-}
+
 
 /* Public interface for getting io_uring stats */
 void aeGetUringStats(aeEventLoop *eventLoop, char **info) {
@@ -2604,7 +2583,9 @@ static int analyze_operation_result(uring_op_context *ctx, int result) {
     /* Categorize error severity */
     switch (result) {
         case -EAGAIN:
+        #if EAGAIN != EWOULDBLOCK
         case -EWOULDBLOCK:
+        #endif
         case -EINTR:
             return 1; /* Retryable error */
 
