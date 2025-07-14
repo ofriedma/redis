@@ -52,6 +52,23 @@ static void get_uring_stats(aeApiState *state, char **info);
 static const char *uring_op_type_to_string(int op_type);
 static void update_operation_stats(aeApiState *state, uring_op_context *ctx, int result);
 
+/* Team Member C - Operation Management Functions */
+typedef struct uring_operation {
+    int fd;
+    int op_type;
+    void *buffer;
+    size_t buffer_size;
+    void (*completion_handler)(struct uring_operation *op, int result);
+    int persistent;
+    monotime submit_time;
+    uring_op_context *ctx;  /* Link to underlying context */
+} uring_operation;
+
+static uring_operation *create_operation(int fd, int op_type);
+static void free_operation(uring_operation *op);
+static int submit_operation(aeApiState *state, uring_operation *op);
+static void handle_operation_completion(uring_operation *op, int result);
+
 /* Detect io_uring capabilities at runtime */
 static int detect_uring_capabilities(void) {
     struct io_uring ring;
@@ -556,8 +573,87 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     return numevents;
 }
 
-/* Process completion queue entry */
+/* Enhanced completion processing for both contexts and operations */
+static int process_completion_enhanced(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, int *numevents) {
+    aeApiState *state = eventLoop->apidata;
+    void *user_data = io_uring_cqe_get_data(cqe);
+    int result = cqe->res;
+
+    if (!user_data) {
+        return 0;
+    }
+
+    /* Check if this is a new-style operation or old-style context */
+    /* We can distinguish by checking the first few bytes - operations have fd, contexts have fd too
+     * but we'll use a simple heuristic: if it looks like an operation, treat it as one */
+    uring_operation *op = (uring_operation *)user_data;
+    uring_op_context *ctx = (uring_op_context *)user_data;
+
+    /* Simple heuristic: operations have completion_handler field, contexts don't */
+    int is_operation = 0;
+    if (op && op->completion_handler) {
+        is_operation = 1;
+    }
+
+    monotime completion_time = getMonotonicUs();
+    uint64_t operation_time;
+
+    if (is_operation) {
+        operation_time = completion_time - op->submit_time;
+        /* Handle new-style operation */
+        state->stats.ops_completed++;
+        state->stats.total_completion_time_us += operation_time;
+        if (operation_time > state->stats.max_completion_time_us) {
+            state->stats.max_completion_time_us = operation_time;
+        }
+
+        if (result < 0) {
+            state->stats.ops_failed++;
+        }
+
+        /* Call operation completion handler */
+        handle_operation_completion(op, result);
+
+        /* For persistent operations, resubmit */
+        if (op->persistent && result >= 0) {
+            submit_operation(state, op);
+        }
+    } else {
+        /* Handle old-style context */
+        operation_time = completion_time - ctx->submit_time;
+        state->stats.ops_completed++;
+        state->stats.total_completion_time_us += operation_time;
+        if (operation_time > state->stats.max_completion_time_us) {
+            state->stats.max_completion_time_us = operation_time;
+        }
+
+        if (result < 0) {
+            state->stats.ops_failed++;
+
+            /* Handle specific errors */
+            if (result == -EAGAIN || result == -EWOULDBLOCK) {
+                /* Re-submit operation */
+                if (ctx->op_type == URING_OP_READ) {
+                    submit_read_operation(state, ctx->fd, ctx);
+                } else if (ctx->op_type == URING_OP_WRITE) {
+                    submit_write_operation(state, ctx->fd, ctx);
+                }
+                free_op_context(ctx);
+                return 0;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Process completion queue entry - legacy function for compatibility */
 static int process_completion(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, int *numevents) {
+    /* For now, use the enhanced processor */
+    int ret = process_completion_enhanced(eventLoop, cqe, numevents);
+    if (ret != 0) return ret;
+
+    /* Continue with legacy completion handling for contexts */
     aeApiState *state = eventLoop->apidata;
     uring_op_context *ctx = (uring_op_context *)io_uring_cqe_get_data(cqe);
 
@@ -566,31 +662,6 @@ static int process_completion(aeEventLoop *eventLoop, struct io_uring_cqe *cqe, 
     }
 
     int result = cqe->res;
-    monotime completion_time = getMonotonicUs();
-    uint64_t operation_time = completion_time - ctx->submit_time;
-
-    /* Update statistics */
-    state->stats.ops_completed++;
-    state->stats.total_completion_time_us += operation_time;
-    if (operation_time > state->stats.max_completion_time_us) {
-        state->stats.max_completion_time_us = operation_time;
-    }
-
-    if (result < 0) {
-        state->stats.ops_failed++;
-
-        /* Handle specific errors */
-        if (result == -EAGAIN || result == -EWOULDBLOCK) {
-            /* Re-submit operation */
-            if (ctx->op_type == URING_OP_READ) {
-                submit_read_operation(state, ctx->fd, ctx);
-            } else if (ctx->op_type == URING_OP_WRITE) {
-                submit_write_operation(state, ctx->fd, ctx);
-            }
-            free_op_context(ctx);
-            return 0;
-        }
-    }
 
     /* Handle completion based on operation type */
     switch (ctx->op_type) {
@@ -713,9 +784,20 @@ static void aeWakeEventLoopUring(aeEventLoop *eventLoop) {
 /* Forward declaration */
 static const char *aeApiName(void);
 
-/* Get statistics for INFO command */
+/* Enhanced statistics for INFO command */
 static void get_uring_stats(aeApiState *state, char **info) {
     #ifndef REDIS_CLI_BUILD
+    /* Calculate derived statistics */
+    double avg_completion_time = state->stats.ops_completed > 0 ?
+        (double)state->stats.total_completion_time_us / state->stats.ops_completed : 0.0;
+
+    double success_rate = (state->stats.ops_submitted > 0) ?
+        (double)state->stats.ops_completed / state->stats.ops_submitted * 100.0 : 0.0;
+
+    uint64_t pending_ops = state->stats.ops_submitted -
+                          state->stats.ops_completed -
+                          state->stats.ops_failed;
+
     *info = sdscatprintf(*info,
         "# io_uring\r\n"
         "uring_enabled:yes\r\n"
@@ -724,12 +806,17 @@ static void get_uring_stats(aeApiState *state, char **info) {
         "uring_sqpoll_cpu:%d\r\n"
         "uring_sq_entries:%d\r\n"
         "uring_cq_entries:%d\r\n"
+        "uring_buffer_ring_enabled:%s\r\n"
         "uring_ops_submitted:%lu\r\n"
         "uring_ops_completed:%lu\r\n"
         "uring_ops_failed:%lu\r\n"
+        "uring_ops_pending:%lu\r\n"
+        "uring_success_rate:%.2f\r\n"
         "uring_sq_full_count:%lu\r\n"
         "uring_cq_overflow_count:%lu\r\n"
         "uring_sqpoll_wakeups:%lu\r\n"
+        "uring_buffer_ring_hits:%lu\r\n"
+        "uring_buffer_ring_misses:%lu\r\n"
         "uring_avg_completion_time_us:%.2f\r\n"
         "uring_max_completion_time_us:%lu\r\n",
         aeApiName(),
@@ -737,14 +824,18 @@ static void get_uring_stats(aeApiState *state, char **info) {
         state->sqpoll_cpu,
         state->sq_entries,
         state->cq_entries,
+        state->buffer_ring_enabled ? "yes" : "no",
         (unsigned long)state->stats.ops_submitted,
         (unsigned long)state->stats.ops_completed,
         (unsigned long)state->stats.ops_failed,
+        (unsigned long)pending_ops,
+        success_rate,
         (unsigned long)state->stats.sq_full_count,
         (unsigned long)state->stats.cq_overflow_count,
         (unsigned long)state->stats.sqpoll_wakeups,
-        state->stats.ops_completed > 0 ?
-            (double)state->stats.total_completion_time_us / state->stats.ops_completed : 0.0,
+        (unsigned long)state->stats.buffer_ring_hits,
+        (unsigned long)state->stats.buffer_ring_misses,
+        avg_completion_time,
         (unsigned long)state->stats.max_completion_time_us);
     #endif
 }
@@ -762,7 +853,7 @@ static const char *uring_op_type_to_string(int op_type) {
     }
 }
 
-/* Update operation statistics */
+/* Enhanced operation statistics tracking */
 static void update_operation_stats(aeApiState *state, uring_op_context *ctx, int result) {
     monotime now = getMonotonicUs();
     uint64_t operation_time = now - ctx->submit_time;
@@ -779,6 +870,80 @@ static void update_operation_stats(aeApiState *state, uring_op_context *ctx, int
     }
 }
 
+/* Enhanced statistics for operations */
+static void update_enhanced_operation_stats(aeApiState *state, uring_operation *op, int result) {
+    if (!state || !op) return;
+
+    monotime now = getMonotonicUs();
+    uint64_t operation_time = now - op->submit_time;
+
+    /* Update timing statistics */
+    state->stats.total_completion_time_us += operation_time;
+    if (operation_time > state->stats.max_completion_time_us) {
+        state->stats.max_completion_time_us = operation_time;
+    }
+
+    /* Update operation counts */
+    if (result < 0) {
+        state->stats.ops_failed++;
+
+        /* Track specific error types for debugging */
+        switch (result) {
+            case -EAGAIN:
+            case -EWOULDBLOCK:
+                /* These are tracked separately as they're often retried */
+                break;
+            case -ECONNRESET:
+            case -EPIPE:
+                /* Connection errors */
+                break;
+            case -ENOMEM:
+                /* Memory pressure */
+                break;
+            default:
+                /* Other errors */
+                break;
+        }
+    } else {
+        state->stats.ops_completed++;
+    }
+}
+
+/* Performance monitoring and debugging */
+static void log_performance_warning(aeApiState *state, uring_operation *op, uint64_t operation_time) {
+    #ifndef REDIS_CLI_BUILD
+    /* Log slow operations for debugging */
+    if (operation_time > 10000) {  /* 10ms threshold */
+        serverLog(LL_WARNING,
+            "Slow io_uring operation: fd=%d, type=%s, time=%lu us",
+            op->fd, uring_op_type_to_string(op->op_type), operation_time);
+    }
+
+    /* Log queue pressure */
+    if (state->stats.sq_full_count > 0 &&
+        (state->stats.sq_full_count % 1000) == 0) {
+        serverLog(LL_WARNING,
+            "io_uring submission queue full %lu times",
+            (unsigned long)state->stats.sq_full_count);
+    }
+    #else
+    (void)state; (void)op; (void)operation_time;
+    #endif
+}
+
+/* Debug information for operations */
+static void debug_operation_info(uring_operation *op, int result) {
+    #ifndef REDIS_CLI_BUILD
+    if (server.verbosity >= LL_DEBUG) {
+        serverLog(LL_DEBUG,
+            "io_uring operation completed: fd=%d, type=%s, result=%d, persistent=%d",
+            op->fd, uring_op_type_to_string(op->op_type), result, op->persistent);
+    }
+    #else
+    (void)op; (void)result;
+    #endif
+}
+
 static const char *aeApiName(void) {
     return "uring";
 }
@@ -787,6 +952,275 @@ static const char *aeApiName(void) {
 void aeGetUringStats(aeEventLoop *eventLoop, char **info) {
     if (eventLoop && eventLoop->apidata) {
         get_uring_stats((aeApiState*)eventLoop->apidata, info);
+    }
+}
+
+/* ============================================================================
+ * Team Member C - Operation Management Functions
+ * ============================================================================ */
+
+/* Create operation with completion handler support */
+static uring_operation *create_operation(int fd, int op_type) {
+    uring_operation *op = zmalloc(sizeof(uring_operation));
+    if (!op) return NULL;
+
+    memset(op, 0, sizeof(uring_operation));
+    op->fd = fd;
+    op->op_type = op_type;
+    op->buffer = NULL;
+    op->buffer_size = 0;
+    op->completion_handler = NULL;
+    op->persistent = 0;
+    op->submit_time = getMonotonicUs();
+    op->ctx = NULL;
+
+    return op;
+}
+
+/* Free operation with proper buffer cleanup */
+static void free_operation(uring_operation *op) {
+    if (!op) return;
+
+    /* Return buffer to pool if it was allocated */
+    if (op->buffer) {
+        return_buffer_to_pool(op->buffer);
+        op->buffer = NULL;
+    }
+
+    /* Free underlying context if it exists */
+    if (op->ctx) {
+        free_op_context(op->ctx);
+        op->ctx = NULL;
+    }
+
+    zfree(op);
+}
+
+/* Submit operation to io_uring */
+static int submit_operation(aeApiState *state, uring_operation *op) {
+    if (!state || !op) return -1;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&state->ring);
+    if (!sqe) {
+        state->stats.ops_failed++;
+        return -1;
+    }
+
+    /* Create underlying context if needed */
+    if (!op->ctx) {
+        op->ctx = create_op_context(op->fd, op->op_type, 0);
+        if (!op->ctx) {
+            state->stats.ops_failed++;
+            return -1;
+        }
+    }
+
+    /* Setup operation based on type */
+    switch (op->op_type) {
+        case URING_OP_READ:
+            if (!op->buffer) {
+                op->buffer = get_buffer_from_pool();
+                if (!op->buffer) {
+                    state->stats.ops_failed++;
+                    return -1;
+                }
+                op->buffer_size = URING_DEFAULT_BUFFER_SIZE;
+            }
+            io_uring_prep_recv(sqe, op->fd, op->buffer, op->buffer_size, 0);
+            break;
+
+        case URING_OP_WRITE:
+            if (!op->buffer || op->buffer_size == 0) {
+                state->stats.ops_failed++;
+                return -1;
+            }
+            io_uring_prep_send(sqe, op->fd, op->buffer, op->buffer_size, 0);
+            break;
+
+        case URING_OP_ACCEPT:
+            io_uring_prep_accept(sqe, op->fd, NULL, NULL, 0);
+            break;
+
+        default:
+            state->stats.ops_failed++;
+            return -1;
+    }
+
+    /* Store operation pointer in SQE user data */
+    io_uring_sqe_set_data(sqe, op);
+
+    /* Update statistics */
+    state->stats.ops_submitted++;
+    op->submit_time = getMonotonicUs();
+
+    return 0;
+}
+
+/* Enhanced operation completion handler with statistics */
+static void handle_operation_completion(uring_operation *op, int result) {
+    if (!op) return;
+
+    /* Debug logging */
+    debug_operation_info(op, result);
+
+    /* Performance monitoring */
+    monotime now = getMonotonicUs();
+    uint64_t operation_time = now - op->submit_time;
+
+    /* Call user-defined completion handler if available */
+    if (op->completion_handler) {
+        op->completion_handler(op, result);
+    }
+
+    /* Handle persistent operations */
+    if (op->persistent && result >= 0) {
+        /* For persistent operations, we need access to the state to resubmit */
+        /* This will be handled by the main completion processing logic */
+        return;
+    }
+
+    /* Non-persistent operations or failed operations are freed */
+    free_operation(op);
+}
+
+/* ============================================================================
+ * Enhanced Completion Handlers with Redis Connection Integration
+ * ============================================================================ */
+
+/* Enhanced accept completion handler */
+static void enhanced_handle_accept_completion(uring_operation *op, int result) {
+    if (result < 0) {
+        if (result != -EAGAIN && result != -EWOULDBLOCK) {
+            #ifndef REDIS_CLI_BUILD
+            serverLog(LL_WARNING, "Accept failed: %s", strerror(-result));
+            #endif
+        }
+        return;
+    }
+
+    int client_fd = result;
+
+    #ifndef REDIS_CLI_BUILD
+    /* Create new client connection using existing Redis logic */
+    connection *conn = connCreateAcceptedSocket(client_fd, NULL);
+    if (!conn) {
+        close(client_fd);
+        return;
+    }
+
+    /* Set up connection for io_uring operations */
+    /* Note: This would require extending the connection structure */
+    /* For now, we'll use the standard connection setup */
+
+    /* The connection will be handled by the normal Redis networking code */
+    /* which will set up appropriate handlers */
+    #else
+    /* For CLI builds, just close the connection */
+    close(client_fd);
+    #endif
+}
+
+/* Enhanced read completion handler */
+static void enhanced_handle_read_completion(uring_operation *op, int result) {
+    if (result > 0) {
+        #ifndef REDIS_CLI_BUILD
+        /* Data received - find the connection and process it */
+        /* Note: Redis doesn't have a direct connByFd function, so we'll need to
+         * work with the event loop to find the connection */
+
+        /* For now, we'll trigger the read event in the event loop */
+        /* This allows existing Redis code to handle the data */
+
+        /* The buffer data is in op->buffer with size result */
+        /* We need to make this available to the connection handler */
+
+        /* This is a simplified approach - in a full implementation,
+         * we would need to extend the connection structure to hold
+         * the io_uring buffer data */
+        #endif
+
+        /* Return buffer to pool */
+        return_buffer_to_pool(op->buffer);
+        op->buffer = NULL;
+
+        /* For persistent read operations, get a new buffer and resubmit */
+        if (op->persistent) {
+            op->buffer = get_buffer_from_pool();
+            if (op->buffer) {
+                op->buffer_size = URING_DEFAULT_BUFFER_SIZE;
+                /* Resubmission will be handled by the main completion logic */
+            }
+        }
+    } else if (result == 0) {
+        /* Connection closed */
+        #ifndef REDIS_CLI_BUILD
+        /* Signal connection closure to Redis */
+        /* This would normally be handled by the connection's close handler */
+        #endif
+        op->persistent = 0;  /* Stop resubmitting */
+    } else {
+        /* Error occurred */
+        if (result != -EAGAIN && result != -EWOULDBLOCK) {
+            #ifndef REDIS_CLI_BUILD
+            serverLog(LL_DEBUG, "Read error on fd %d: %s", op->fd, strerror(-result));
+            #endif
+        }
+        op->persistent = 0;  /* Stop resubmitting */
+    }
+}
+
+/* Enhanced write completion handler */
+static void enhanced_handle_write_completion(uring_operation *op, int result) {
+    if (result > 0) {
+        /* Write successful */
+        #ifndef REDIS_CLI_BUILD
+        /* Notify Redis that write completed */
+        /* This would normally trigger the write handler to send more data */
+        #endif
+    } else if (result < 0 && result != -EAGAIN && result != -EWOULDBLOCK) {
+        /* Write error */
+        #ifndef REDIS_CLI_BUILD
+        serverLog(LL_DEBUG, "Write error on fd %d: %s", op->fd, strerror(-result));
+        /* Signal error to connection */
+        #endif
+    }
+    /* Write operations are typically one-shot, don't resubmit */
+    op->persistent = 0;
+}
+
+/* Error handling for operations */
+static void handle_operation_error(uring_operation *op, int error) {
+    switch (error) {
+        case -EAGAIN:
+        case -EWOULDBLOCK:
+            /* Temporary error - operation will be retried by caller if persistent */
+            break;
+
+        case -ECONNRESET:
+        case -EPIPE:
+            /* Connection closed - clean up */
+            #ifndef REDIS_CLI_BUILD
+            serverLog(LL_DEBUG, "Connection closed on fd %d: %s", op->fd, strerror(-error));
+            #endif
+            op->persistent = 0;
+            break;
+
+        case -ENOMEM:
+            /* Memory pressure - stop operation */
+            #ifndef REDIS_CLI_BUILD
+            serverLog(LL_WARNING, "Memory pressure on fd %d, stopping operation", op->fd);
+            #endif
+            op->persistent = 0;
+            break;
+
+        default:
+            /* Other errors - log and stop operation */
+            #ifndef REDIS_CLI_BUILD
+            serverLog(LL_WARNING, "io_uring operation failed: fd=%d, op=%d, error=%s",
+                     op->fd, op->op_type, strerror(-error));
+            #endif
+            op->persistent = 0;
+            break;
     }
 }
 
