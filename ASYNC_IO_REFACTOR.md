@@ -44,45 +44,117 @@ This document outlines the architectural and code changes required to refactor t
 - Handlers must be able to handle partial completions, errors, and cancellations.
 - The event loop should propagate I/O errors to the appropriate handler.
 
-### 5. Backward Compatibility
-- Provide a migration path: support both readiness-based and completion-based handlers during transition.
-- Gradually refactor core networking and AOF code to use async I/O.
+### 7. Code-Level Changes and Examples
 
-### 6. Testing and Debugging
-- Add tests for async I/O paths, including edge cases (partial, out-of-order, and failed completions).
-- Provide debugging tools for tracking outstanding I/O and handler state.
+> **Note:** In a real io_uring-based implementation, the async I/O API must have access to the io_uring ring context (struct io_uring). This can be achieved by either passing a pointer to the ring as an argument to async functions, or by storing the ring in the event loop struct (e.g., aeEventLoop) and accessing it internally. The simplified API signatures in this document are for illustration; actual implementations must ensure the ring context is available for all async operations.
 
-## Example: Async Read Flow for `readQueryFromClient`
+#### Event Loop API Changes
+- The event loop (see `src/ae.c`, `src/ae.h`) will need new APIs for submitting async I/O operations:
+  - `aeAsyncRead(fd, buffer, len, callback, user_data)`
+  - `aeAsyncWrite(fd, buffer, len, callback, user_data)`
+  - `aeAsyncAccept(fd, callback, user_data)`
+- The event loop must track outstanding I/O requests and dispatch completions to the correct callback.
+- Example (pseudo-C):
+  ```c
+  // New API for async read
+  int aeAsyncRead(int fd, void *buf, size_t len, void (*cb)(int fd, ssize_t nread, void *buf, void *user_data), void *user_data);
+  ```
 
-### Current Flow
-1. The event loop notifies `readQueryFromClient` when the client socket is readable.
-2. `readQueryFromClient` performs a blocking read from the socket into the client's query buffer.
-3. The handler processes the buffer and parses commands.
+#### Handler Refactoring
+- Handlers such as `readQueryFromClient` (in `src/networking.c`) must be split into:
+  - A function to submit the async read (e.g., `submitReadQueryFromClient`)
+  - A completion callback (e.g., `readQueryFromClientAsync`)
+- Example (pseudo-C):
+  ```c
+  // Called when a new client is ready for input
+  void submitReadQueryFromClient(client *c) {
+      aeAsyncRead(c->fd, c->querybuf, sizeof(c->querybuf), readQueryFromClientAsync, c);
+  }
 
-### Target Async I/O Flow
-1. When a new client connection is established, the connection management code (not the event loop itself) submits the initial async read operation for the client socket, providing a buffer and a completion callback (e.g., `readQueryFromClientAsync`).
-2. On I/O completion, the event loop invokes the `readQueryFromClientAsync` handler with the buffer and result (number of bytes read, or error).
-3. `readQueryFromClientAsync` processes the data in the buffer, updates the client's state, and parses commands. If more data is needed, it can submit another async read by requesting it from the event loop.
-4. The event loop is responsible only for dispatching completions, not for initiating application-specific I/O.
-5. The handler never blocks and does not perform direct I/O; all reads are managed by the async I/O subsystem.
+  // Completion callback
+  void readQueryFromClientAsync(int fd, ssize_t nread, void *buf, void *user_data) {
+      client *c = (client*)user_data;
+      if (nread > 0) {
+          // Process buffer, parse commands, update state
+      } else if (nread == 0) {
+          // Client closed connection
+      } else {
+          // Handle error
+      }
+      // If more data needed:
+      // submitReadQueryFromClient(c);
+  }
+  ```
+- All direct calls to `read()`/`write()` in handlers must be replaced with async submission and completion logic.
 
-### Key Changes
-- The initial async read is submitted by the connection management logic, not the event loop itself.
-- The handler is invoked on I/O completion, not readiness.
-- Buffer management is handled by the event loop or a buffer manager.
-- The handler must be able to process partial reads and maintain state across multiple async operations.
+#### Buffer Management
+- Buffers may be managed per-client or via a central pool.
+- The event loop or a buffer manager should allocate and recycle buffers for async I/O.
+- Example:
+  ```c
+  void *buf = buffer_pool_get();
+  aeAsyncRead(fd, buf, BUFSIZE, callback, user_data);
+  // In callback: buffer_pool_release(buf);
+  ```
 
-## Challenges
+#### Affected Functions (Non-Exhaustive)
+- `readQueryFromClient` (src/networking.c): Refactor to async pattern.
+- `writeToClient` (src/networking.c): Refactor to async write.
+- `acceptTcpHandler` (src/networking.c): Refactor to async accept.
+- AOF and replication I/O (src/aof.c, src/replication.c): Refactor to async file/socket I/O.
+- Event loop API and implementation (src/ae.h, src/ae.c): Add async I/O support and completion dispatch.
 
-- Refactoring stateful handlers to work with callbacks and async completions.
-- Managing buffer lifetimes and memory efficiently.
-- Ensuring correctness and performance under high concurrency.
+#### Overview of Changes
+- Add async I/O submission and completion APIs to the event loop.
+- Refactor networking and I/O handlers to use async callbacks.
+- Implement buffer management for async operations.
+- Update error handling to propagate I/O errors via callbacks.
+- Gradually migrate all blocking I/O to async equivalents.
 
-## References
+## Implementation Steps
 
-- [io_uring documentation](https://kernel.dk/io_uring.pdf)
-- [libuv async I/O architecture](https://libuv.org/)
-- [Redis event loop design](https://github.com/redis/redis/blob/unstable/src/ae.c)
+The following steps outline a recommended path for refactoring Redis to support true async I/O. Each step is designed to be as self-contained as possible, allowing for incremental progress and easier review/testing.
+
+1. **Introduce Async I/O Abstractions**
+   - Define async I/O API functions in the event loop (e.g., `aeAsyncRead`, `aeAsyncWrite`, `aeAsyncAccept`).
+   - Add callback and user data support for completions.
+   - Integrate the io_uring ring context into the event loop struct.
+
+2. **Implement Buffer Management**
+   - Create a buffer pool or per-client buffer management system for async operations.
+   - Ensure buffers can be efficiently allocated, reused, and released.
+
+3. **Add Async I/O Submission and Completion Logic**
+   - Implement logic in the event loop to submit I/O requests to io_uring and dispatch completions to registered callbacks.
+   - Add tracking for outstanding requests and their associated state.
+
+4. **Refactor Client Read Path**
+   - Refactor `readQueryFromClient` to use async read submission and a completion callback (e.g., `readQueryFromClientAsync`).
+   - Update connection management code to submit the initial async read for each client.
+
+5. **Refactor Client Write Path**
+   - Refactor `writeToClient` to use async write submission and a completion callback.
+   - Update all code paths that trigger client writes to use the new async API.
+
+6. **Refactor Accept Path**
+   - Refactor `acceptTcpHandler` to use async accept operations and completion callbacks.
+   - Update server socket setup to submit async accept requests.
+
+7. **Refactor AOF and Replication I/O**
+   - Update AOF (Append Only File) and replication code to use async file and socket I/O APIs.
+   - Ensure all blocking I/O in these subsystems is replaced with async equivalents.
+
+8. **Update Error Handling and State Management**
+   - Ensure all async handlers properly handle partial completions, errors, and cancellations.
+   - Refactor state management in handlers to support async operation lifecycles.
+
+9. **Testing and Validation**
+   - Add and update tests to cover async I/O paths, including edge cases and error scenarios.
+   - Validate performance and correctness under high concurrency.
+
+10. **Deprecate and Remove Blocking I/O Paths**
+    - Once all major I/O paths are async, remove legacy blocking I/O code and readiness-based event loop logic.
+    - Update documentation to reflect the new async architecture.
 
 ---
 
