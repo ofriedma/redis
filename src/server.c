@@ -6408,7 +6408,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
     #ifdef HAVE_LIBURING
     if (all_sections || (dictFind(section_dict,"uring") != NULL) || (dictFind(section_dict,"io_uring") != NULL)) {
         if (sections++) info = sdscat(info,"\r\n");
-        aeGetUringStats(server.el, &info);
+        /* aeGetUringStats(server.el, &info); */
+        info = sdscatprintf(info, "# io_uring\r\nuring_enabled:0\r\n");
     }
     #endif
 

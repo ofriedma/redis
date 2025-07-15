@@ -129,8 +129,18 @@ client *createClient(connection *conn) {
         connEnableTcpNoDelay(conn);
         if (server.tcpkeepalive)
             connKeepAlive(conn,server.tcpkeepalive);
-        connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
+
+        /* Week 3: Use io_uring handlers if enabled and appropriate */
+#ifdef HAVE_LIBURING
+        if (shouldUseUringForClient(c)) {
+            /* Will set up io_uring handlers after client is fully initialized */
+        } else {
+            connSetReadHandler(conn, readQueryFromClient);
+        }
+#else
+        connSetReadHandler(conn, readQueryFromClient);
+#endif
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
     selectDb(c,0);
@@ -231,6 +241,14 @@ client *createClient(connection *conn) {
     c->net_input_bytes = 0;
     c->net_output_bytes = 0;
     c->commands_processed = 0;
+
+    /* Week 3: Set up io_uring handlers if appropriate */
+#ifdef HAVE_LIBURING
+    if (conn && shouldUseUringForClient(c)) {
+        setupClientUringHandlers(c);
+    }
+#endif
+
     return c;
 }
 
@@ -2239,6 +2257,150 @@ void sendReplyToClient(connection *conn) {
     writeToClient(c,1);
 }
 
+/* Week 3: io_uring specific write handler */
+#ifdef HAVE_LIBURING
+void sendReplyToClientUring(connection *conn) {
+    client *c = connGetPrivateData(conn);
+
+    if (!c || !clientHasPendingReplies(c)) {
+        return;
+    }
+
+    /* For io_uring, we need to prepare data and submit write operation */
+    size_t write_len = 0;
+    void *write_data = NULL;
+
+    /* Get data to write from client buffers */
+    if (c->bufpos > 0) {
+        /* Data in static buffer */
+        write_data = c->buf;
+        write_len = c->bufpos;
+    } else if (listLength(c->reply) > 0) {
+        /* Data in reply list - for simplicity, handle first item */
+        listNode *ln = listFirst(c->reply);
+        clientReplyBlock *o = listNodeValue(ln);
+
+        /* Use the buffer data directly */
+        write_data = o->buf + c->sentlen;
+        write_len = o->used - c->sentlen;
+    } else {
+        /* No data to write */
+        return;
+    }
+
+    if (write_len == 0) return;
+
+    /* Submit io_uring write operation */
+    if (connSubmitUringWrite(conn, write_data, write_len) == C_OK) {
+        /* Write operation submitted successfully */
+        /* Note: actual completion will be handled by completion handler */
+        return;
+    } else {
+        /* Failed to submit io_uring write - fall back to regular write */
+        writeToClient(c, 1);
+    }
+}
+
+/* Handle io_uring write completion for client */
+void handleUringWriteCompletion(connection *conn, int result) {
+    client *c = connGetPrivateData(conn);
+
+    if (!c) return;
+
+    if (result > 0) {
+        /* Write successful - update client state */
+        c->lastinteraction = server.unixtime;
+
+        if (c->flags & CLIENT_MASTER) {
+            atomicIncr(server.stat_net_repl_output_bytes, result);
+        } else {
+            atomicIncr(server.stat_net_output_bytes, result);
+        }
+        c->net_output_bytes += result;
+
+        /* Update buffer positions */
+        if (c->bufpos > 0) {
+            if (result >= c->bufpos) {
+                /* All static buffer data written */
+                c->bufpos = 0;
+            } else {
+                /* Partial write of static buffer */
+                memmove(c->buf, c->buf + result, c->bufpos - result);
+                c->bufpos -= result;
+            }
+        } else if (listLength(c->reply) > 0) {
+            /* Handle reply list updates */
+            listNode *ln = listFirst(c->reply);
+            clientReplyBlock *o = listNodeValue(ln);
+
+            c->sentlen += result;
+
+            if (c->sentlen >= o->used) {
+                /* Entire block written */
+                c->sentlen = 0;
+                c->reply_bytes -= o->size;
+                listDelNode(c->reply, ln);
+            }
+        }
+
+        /* Check if there's more data to write */
+        if (clientHasPendingReplies(c)) {
+            /* Submit another write operation */
+            sendReplyToClientUring(conn);
+        } else {
+            /* All data written - remove write handler */
+            connSetWriteHandler(conn, NULL);
+        }
+    } else {
+        /* Write error - close connection */
+        freeClientAsync(c);
+    }
+}
+#endif /* HAVE_LIBURING */
+
+/* Week 3: Function to set up io_uring handlers for a client connection */
+#ifdef HAVE_LIBURING
+int setupClientUringHandlers(client *c) {
+    if (!c || !c->conn) return C_ERR;
+
+    /* Initialize io_uring specific connection fields */
+    connInitUring(c->conn);
+
+    /* Set up io_uring specific read handler */
+    connSetReadHandler(c->conn, readQueryFromClientUring);
+
+    /* Submit initial read operation */
+    if (connSubmitUringRead(c->conn) != C_OK) {
+        /* Failed to submit read - fall back to regular event handling */
+        connSetReadHandler(c->conn, readQueryFromClient);
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
+/* Week 3: Function to check if io_uring should be used for a client */
+int shouldUseUringForClient(client *c) {
+    /* Don't use io_uring for:
+     * 1. Clients that must be handled by main thread
+     * 2. Lua clients
+     * 3. Blocked clients
+     * 4. Master/replica connections (for now)
+     */
+    if (!c || !c->conn) return 0;
+    if (isClientMustHandledByMainThread(c)) return 0;
+    if (c->flags & (CLIENT_SCRIPT|CLIENT_BLOCKED)) return 0;
+    if (c->flags & (CLIENT_MASTER|CLIENT_SLAVE)) return 0;
+
+    /* Check if io_uring is enabled in server config */
+#ifdef HAVE_LIBURING
+    return server.uring_config.enabled;
+#else
+    return 0;
+#endif
+}
+#endif /* HAVE_LIBURING */
+
 /* This function is called just before entering the event loop, in the hope
  * we can just write the replies to the client output buffer without any
  * need to use a syscall in order to install the writable event handler,
@@ -3135,6 +3297,120 @@ done:
     }
     beforeNextClient(c);
 }
+
+/* Week 3: io_uring specific read handler */
+#ifdef HAVE_LIBURING
+void readQueryFromClientUring(connection *conn) {
+    client *c = connGetPrivateData(conn);
+
+    if (!(c->io_flags & CLIENT_IO_READ_ENABLED)) return;
+    c->read_error = 0;
+
+    /* Update the number of reads of io threads on server */
+    atomicIncr(server.stat_io_reads_processed[c->running_tid], 1);
+
+    /* For io_uring, the data is already in the connection's read buffer */
+    if (!conn->uring_read_buffer || conn->uring_read_size <= 0) {
+        /* No data available - this shouldn't happen in normal operation */
+        return;
+    }
+
+    int nread = conn->uring_read_size;
+    void *read_data = conn->uring_read_buffer;
+
+    /* Handle query buffer allocation similar to regular readQueryFromClient */
+    size_t qblen = 0;
+    int big_arg = 0;
+
+    /* Check for big argument optimization */
+    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
+        && c->bulklen >= PROTO_MBULK_BIG_ARG)
+    {
+        if (!c->querybuf) c->querybuf = sdsempty();
+        big_arg = 1;
+    } else if (c->querybuf == NULL) {
+        if (unlikely(thread_reusable_qb_used)) {
+            c->querybuf = sdsnewlen(NULL, PROTO_IOBUF_LEN);
+            sdsclear(c->querybuf);
+        } else {
+            if (!thread_reusable_qb) {
+                thread_reusable_qb = sdsnewlen(NULL, PROTO_IOBUF_LEN);
+                sdsclear(thread_reusable_qb);
+            }
+            serverAssert(sdslen(thread_reusable_qb) == 0);
+            c->querybuf = thread_reusable_qb;
+            c->io_flags |= CLIENT_IO_REUSABLE_QUERYBUFFER;
+            thread_reusable_qb_used = 1;
+        }
+    }
+
+    qblen = sdslen(c->querybuf);
+
+    /* Ensure query buffer has enough space */
+    if (!(c->flags & CLIENT_MASTER) &&
+        (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN)) {
+        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, nread);
+        if (c->querybuf_peak < qblen + nread) c->querybuf_peak = qblen + nread;
+    } else {
+        c->querybuf = sdsMakeRoomFor(c->querybuf, nread);
+    }
+
+    /* Copy data from io_uring buffer to query buffer */
+    memcpy(c->querybuf + qblen, read_data, nread);
+    sdsIncrLen(c->querybuf, nread);
+    qblen = sdslen(c->querybuf);
+    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
+
+    /* Update client statistics */
+    c->lastinteraction = server.unixtime;
+    if (c->flags & CLIENT_MASTER) {
+        c->read_reploff += nread;
+        atomicIncr(server.stat_net_repl_input_bytes, nread);
+    } else {
+        atomicIncr(server.stat_net_input_bytes, nread);
+    }
+    c->net_input_bytes += nread;
+
+    /* Check query buffer limits */
+    if (!(c->flags & CLIENT_MASTER) &&
+        (c->mstate.argv_len_sums + sdslen(c->querybuf) > server.client_max_querybuf_len ||
+         (c->mstate.argv_len_sums + sdslen(c->querybuf) > 1024*1024 && authRequired(c))))
+    {
+        c->read_error = CLIENT_READ_REACHED_MAX_QUERYBUF;
+        freeClientAsync(c);
+        atomicIncr(server.stat_client_qbuf_limit_disconnections, 1);
+        goto done;
+    }
+
+    /* Process the input buffer */
+    if (processInputBuffer(c) == C_ERR)
+         c = NULL;
+
+done:
+    /* Clear the io_uring read buffer reference */
+    conn->uring_read_buffer = NULL;
+    conn->uring_read_size = 0;
+
+    if (c && c->read_error) {
+        if (c->running_tid == IOTHREAD_MAIN_THREAD_ID) {
+            handleClientReadError(c);
+        }
+    }
+
+    if (c && (c->io_flags & CLIENT_IO_REUSABLE_QUERYBUFFER)) {
+        serverAssert(c->qb_pos == 0);
+        resetReusableQueryBuf(c);
+    }
+
+    /* Submit next read operation */
+    if (c && connSubmitUringRead(conn) != C_OK) {
+        /* Failed to submit next read - fall back to regular event handling */
+        connSetReadHandler(conn, readQueryFromClient);
+    }
+
+    beforeNextClient(c);
+}
+#endif /* HAVE_LIBURING */
 
 /* A Redis "Address String" is a colon separated ip:port pair.
  * For IPv4 it's in the form x.y.z.k:port, example: "127.0.0.1:1234".

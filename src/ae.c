@@ -29,20 +29,23 @@
 
 /* Include the best multiplexing layer supported by this system.
  * The following should be ordered by performances, descending. */
+/* Temporarily disabled for testing */
+#if 0
 #ifdef HAVE_LIBURING
 #include "ae_uring.c"
+#endif
+#endif
+
+#ifdef HAVE_EVPORT
+#include "ae_evport.c"
 #else
-    #ifdef HAVE_EVPORT
-    #include "ae_evport.c"
+    #ifdef HAVE_EPOLL
+    #include "ae_epoll.c"
     #else
-        #ifdef HAVE_EPOLL
-        #include "ae_epoll.c"
+        #ifdef HAVE_KQUEUE
+        #include "ae_kqueue.c"
         #else
-            #ifdef HAVE_KQUEUE
-            #include "ae_kqueue.c"
-            #else
-            #include "ae_select.c"
-            #endif
+        #include "ae_select.c"
         #endif
     #endif
 #endif

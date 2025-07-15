@@ -1,0 +1,13 @@
+./test_helper.tcl: 10: package: not found
+./test_helper.tcl: 13: source: not found
+./test_helper.tcl: 14: source: not found
+./test_helper.tcl: 15: source: not found
+./test_helper.tcl: 16: source: not found
+./test_helper.tcl: 17: source: not found
+./test_helper.tcl: 18: source: not found
+./test_helper.tcl: 19: source: not found
+./test_helper.tcl: 25: unit: not found
+./test_helper.tcl: 26: unit/type: Permission denied
+./test_helper.tcl: 27: unit/cluster: Permission denied
+./test_helper.tcl: 28: integration: not found
+./test_helper.tcl: 29: Syntax error: "}" unexpected

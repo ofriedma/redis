@@ -87,7 +87,8 @@ typedef enum {
     URING_OP_PRIORITY_LOW = 0,
     URING_OP_PRIORITY_NORMAL,
     URING_OP_PRIORITY_HIGH,
-    URING_OP_PRIORITY_CRITICAL
+    URING_OP_PRIORITY_CRITICAL,
+    URING_OP_PRIORITY_BACKGROUND
 } uring_op_priority;
 
 /* Enhanced per-operation context */
@@ -136,6 +137,14 @@ typedef struct uring_op_context {
     /* Error handling */
     int last_error;
     char error_msg[256];
+
+    /* Week 3 enhancements */
+    int multishot_active;                   /* Flag for multishot operations */
+
+    /* Week 5 production optimizations */
+    int provided_buffer_id;                 /* ID for provided buffer */
+    int multishot_accept_active;            /* Flag for multishot accept */
+    int sqpoll_enabled;                     /* SQPOLL mode enabled */
 
     /* Resource tracking */
     struct uring_conn_context *conn_ctx; /* Associated connection */
@@ -250,7 +259,7 @@ typedef struct aeApiState {
         uring_op_context *head;
         uring_op_context *tail;
         int count;
-    } priority_queues[4];               /* One for each priority level */
+    } priority_queues[5];               /* One for each priority level */
 
     /* Connection lifecycle management */
     uring_conn_context **connections;  /* Connection contexts by FD */
@@ -264,7 +273,18 @@ typedef struct aeApiState {
     struct io_uring_sqe *batch_sqes[URING_MAX_BATCH_SIZE];
     int batch_count;
     pthread_mutex_t batch_lock;
-    
+
+    /* Week 5 production optimizations */
+    void *provided_buffer_ring;         /* Provided buffer ring */
+    void *provided_buffers;             /* Provided buffer memory */
+    int provided_buffer_count;          /* Number of provided buffers */
+    int provided_buffer_size;           /* Size of each provided buffer */
+    int *registered_fds;                /* Registered file descriptors */
+    int max_registered_fds;             /* Maximum number of registered FDs */
+    int registered_fd_count;            /* Current number of registered FDs */
+    int fast_poll_enabled;              /* Fast polling mode enabled */
+    int defer_taskrun_enabled;          /* Defer task running enabled */
+
     /* Statistics */
     struct {
         uint64_t ops_submitted;
@@ -304,6 +324,32 @@ typedef struct aeApiState {
         uint64_t buffer_deallocations;
         uint64_t context_allocations;
         uint64_t context_deallocations;
+
+        /* Week 3 enhanced statistics */
+        uint64_t full_batch_submissions;
+        uint64_t submit_errors;
+        uint64_t timeout_events;
+        uint64_t wait_errors;
+        uint64_t avg_completions_per_batch;
+        uint64_t null_context_completions;
+        uint64_t invalid_context_completions;
+        uint64_t multishot_completions;
+        uint64_t sq_full_errors;
+        uint64_t invalid_submission_errors;
+        uint64_t memory_errors;
+        uint64_t other_submission_errors;
+        uint64_t resubmission_attempts;
+        uint64_t accept_errors;
+        uint64_t successful_accepts;
+        uint64_t read_errors;
+        uint64_t successful_reads;
+        uint64_t bytes_read;
+        uint64_t write_errors;
+        uint64_t successful_writes;
+        uint64_t bytes_written;
+        uint64_t connection_closures;
+        uint64_t generic_errors;
+        uint64_t generic_completions;
     } stats;
 } aeApiState;
 
@@ -321,6 +367,15 @@ typedef struct {
     int multishot_accept;               /* Use multishot accept */
     int multishot_recv;                 /* Use multishot recv */
     int linked_ops;                     /* Use linked operations */
+
+    /* Week 5 production optimizations */
+    int use_provided_buffers;           /* Use provided buffers for reads */
+    int provided_buffer_count;          /* Number of provided buffers */
+    int cqe_wait_timeout_ms;            /* CQE wait timeout in milliseconds */
+    int use_registered_fds;             /* Use registered file descriptors */
+    int max_registered_fds;             /* Maximum number of registered FDs */
+    int use_fast_poll;                  /* Use fast polling mode */
+    int defer_taskrun;                  /* Defer task running */
 } uring_config;
 
 /* Function prototypes */
@@ -328,10 +383,15 @@ typedef struct {
 /* Public interface functions */
 void aeGetUringStats(aeEventLoop *eventLoop, char **info);
 
-/* Functions needed by socket.c */
+/* Functions needed by socket.c and connection.c */
 uring_op_context *create_op_context(int fd, int op_type, int mask);
 int submit_read_operation(aeApiState *state, int fd, uring_op_context *ctx);
+/* int submit_write_operation(aeApiState *state, int fd, uring_op_context *ctx); */
 int submit_accept_operation(aeApiState *state, int fd, uring_op_context *ctx);
+/* void *get_buffer_from_pool(uring_buffer_ring *pool);
+void return_buffer_to_pool(uring_buffer_ring *pool, void *buffer); */
+void cancel_operation(aeApiState *state, uring_op_context *ctx);
+/* void free_op_context(uring_op_context *ctx); */
 
 /* Connection lifecycle management functions */
 uring_conn_context *create_connection_context(aeApiState *state, int fd, connection *conn);
@@ -341,6 +401,14 @@ void update_connection_state(uring_conn_context *conn_ctx, uring_connection_stat
 void update_connection_activity(uring_conn_context *conn_ctx);
 void cleanup_connection_operations(aeApiState *state, uring_conn_context *conn_ctx);
 void get_connection_stats(aeApiState *state, char **info);
+
+/* Week 3 enhanced function prototypes */
+/* Static function declarations removed - implemented in ae_uring.c */
+
+/* Week 5 monitoring and debugging functions */
+/* void aeUringDebugDump(aeEventLoop *eventLoop, sds *output); */
+void aeUringResetStats(aeEventLoop *eventLoop);
+/* void aeUringGetRealTimeMetrics(aeEventLoop *eventLoop, dict *metrics); */
 
 /* Operation lifecycle management functions */
 uring_op_context *create_operation_context(aeApiState *state, int fd, int op_type, uring_op_priority priority);

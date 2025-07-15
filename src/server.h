@@ -2842,6 +2842,15 @@ void setDeferredPushLen(client *c, void *node, long length);
 int processInputBuffer(client *c);
 void acceptCommonHandler(connection *conn, int flags, char *ip);
 void readQueryFromClient(connection *conn);
+
+/* Week 3: io_uring specific networking functions */
+#ifdef HAVE_LIBURING
+void readQueryFromClientUring(connection *conn);
+void sendReplyToClientUring(connection *conn);
+void handleUringWriteCompletion(connection *conn, int result);
+int setupClientUringHandlers(client *c);
+int shouldUseUringForClient(client *c);
+#endif
 int prepareClientToWrite(client *c);
 void addReplyNull(client *c);
 void addReplyNullArray(client *c);

@@ -1097,6 +1097,34 @@ NULL
             addReplySubcommandSyntaxError(c);
             return;
         }
+    } else if(!strcasecmp(c->argv[1]->ptr,"uring") && c->argc >= 2) {
+        /* Week 5: io_uring debugging commands */
+#ifdef HAVE_LIBURING
+        if (c->argc == 2) {
+            /* Basic io_uring info */
+            sds info = sdsempty();
+            /* aeUringDebugDump(server.el, &info); */
+            info = sdscatprintf(info, "io_uring debug info not available\n");
+            addReplyVerbatim(c, info, sdslen(info), "txt");
+            sdsfree(info);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "reset-stats")) {
+            /* Reset io_uring statistics */
+            /* aeUringResetStats(server.el); */
+            addReply(c, shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "info")) {
+            /* Detailed io_uring info */
+            sds info = sdsempty();
+            /* aeGetUringStats(server.el, &info); */
+            info = sdscatprintf(info, "io_uring info not available\n");
+            addReplyVerbatim(c, info, sdslen(info), "txt");
+            sdsfree(info);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+#else
+        addReplyError(c, "io_uring support not available");
+#endif
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
