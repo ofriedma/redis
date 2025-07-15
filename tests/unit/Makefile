@@ -21,7 +21,7 @@ endif
 FRAMEWORK_OBJS = test_uring_framework.o
 
 # Test executables
-TESTS = test_uring_basic
+TESTS = test_uring_basic test_uring_week2 test_uring_week3
 
 # Default target
 all: check-env $(TESTS)
@@ -48,6 +48,12 @@ test_uring_framework.o: test_uring_framework.c test_uring_framework.h
 # Individual test compilation
 test_uring_basic: test_uring_basic.c $(FRAMEWORK_OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) test_uring_basic.c $(FRAMEWORK_OBJS) $(LIBS) -o test_uring_basic
+
+test_uring_week2: test_uring_week2.c $(FRAMEWORK_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) test_uring_week2.c $(FRAMEWORK_OBJS) $(LIBS) -o test_uring_week2
+
+test_uring_week3: test_uring_week3.c $(FRAMEWORK_OBJS)
+	$(CC) $(CFLAGS) $(INCLUDES) test_uring_week3.c $(FRAMEWORK_OBJS) $(LIBS) -o test_uring_week3
 
 # Run all tests
 test: $(TESTS)

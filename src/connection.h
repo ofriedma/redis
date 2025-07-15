@@ -107,6 +107,18 @@ struct connection {
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
     ConnectionCallbackFunc read_handler;
+
+    /* Week 3: io_uring specific fields */
+#ifdef HAVE_LIBURING
+    void *uring_read_buffer;        /* Pre-allocated read buffer for io_uring */
+    size_t uring_read_size;         /* Size of data in read buffer */
+    void *uring_write_buffer;       /* Pre-allocated write buffer for io_uring */
+    size_t uring_write_size;        /* Size of data to write */
+    int uring_read_pending;         /* Read operation pending */
+    int uring_write_pending;        /* Write operation pending */
+    struct uring_op_context *uring_read_ctx;   /* Active read operation context */
+    struct uring_op_context *uring_write_ctx;  /* Active write operation context */
+#endif
 };
 
 #define CONFIG_BINDADDR_MAX 16
@@ -447,6 +459,36 @@ static inline aeFileProc *connAcceptHandler(ConnectionType *ct) {
 
 /* Get Listeners information, note that caller should free the non-empty string */
 sds getListensInfoString(sds info);
+
+/* Week 3: io_uring specific connection functions */
+#ifdef HAVE_LIBURING
+/* Initialize io_uring specific connection fields */
+void connInitUring(connection *conn);
+
+/* Clean up io_uring specific connection fields */
+void connCleanupUring(connection *conn);
+
+/* Submit io_uring read operation for connection */
+int connSubmitUringRead(connection *conn);
+
+/* Submit io_uring write operation for connection */
+int connSubmitUringWrite(connection *conn, const void *data, size_t len);
+
+/* Handle io_uring read completion */
+void connHandleUringReadCompletion(connection *conn, int result);
+
+/* Handle io_uring write completion */
+void connHandleUringWriteCompletion(connection *conn, int result);
+
+/* Check if connection has pending io_uring operations */
+int connHasUringPendingOps(connection *conn);
+
+/* Get connection by file descriptor */
+connection *connGetFromFd(int fd);
+
+/* Create accepted socket connection */
+/* connection *connCreateAcceptedSocket(int fd); */
+#endif
 
 int RedisRegisterConnectionTypeSocket(void);
 int RedisRegisterConnectionTypeUnix(void);
