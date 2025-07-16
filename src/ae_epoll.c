@@ -10,6 +10,8 @@
 
 
 #include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 typedef struct aeApiState {
     int epfd;
@@ -116,4 +118,51 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
 
 static char *aeApiName(void) {
     return "epoll";
+}
+
+/* ======================== Async I/O API Implementation ===================== */
+
+/* Simulated async read - immediately performs the read and calls callback */
+int aeAsyncRead(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+               aeAsyncReadProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    /* For simulation, we perform the read immediately and call the callback */
+    ssize_t nread = read(fd, buf, len);
+
+    /* Call the callback with the result */
+    if (callback) {
+        callback(fd, nread, buf, user_data);
+    }
+
+    return AE_OK;
+}
+
+/* Simulated async write - immediately performs the write and calls callback */
+int aeAsyncWrite(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+                aeAsyncWriteProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    /* For simulation, we perform the write immediately and call the callback */
+    ssize_t nwritten = write(fd, buf, len);
+
+    /* Call the callback with the result */
+    if (callback) {
+        callback(fd, nwritten, user_data);
+    }
+
+    return AE_OK;
+}
+
+/* Simulated async accept - immediately performs the accept and calls callback */
+int aeAsyncAccept(aeEventLoop *eventLoop, int fd,
+                 aeAsyncAcceptProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    /* For simulation, we perform the accept immediately and call the callback */
+    int client_fd = accept(fd, NULL, NULL);
+
+    /* Call the callback with the result */
+    if (callback) {
+        callback(fd, client_fd, user_data);
+    }
+
+    return AE_OK;
 }

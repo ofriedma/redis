@@ -88,3 +88,37 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
 static char *aeApiName(void) {
     return "select";
 }
+
+/* ======================== Async I/O API Implementation ===================== */
+
+/* Async I/O not supported in select implementation - return error */
+int aeAsyncRead(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+               aeAsyncReadProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    AE_NOTUSED(fd);
+    AE_NOTUSED(buf);
+    AE_NOTUSED(len);
+    AE_NOTUSED(callback);
+    AE_NOTUSED(user_data);
+    return AE_ERR;
+}
+
+int aeAsyncWrite(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+                aeAsyncWriteProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    AE_NOTUSED(fd);
+    AE_NOTUSED(buf);
+    AE_NOTUSED(len);
+    AE_NOTUSED(callback);
+    AE_NOTUSED(user_data);
+    return AE_ERR;
+}
+
+int aeAsyncAccept(aeEventLoop *eventLoop, int fd,
+                 aeAsyncAcceptProc *callback, void *user_data) {
+    AE_NOTUSED(eventLoop);
+    AE_NOTUSED(fd);
+    AE_NOTUSED(callback);
+    AE_NOTUSED(user_data);
+    return AE_ERR;
+}

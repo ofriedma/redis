@@ -231,6 +231,10 @@ else
 	# All the other OSes (notably Linux)
 	FINAL_LDFLAGS+= -rdynamic
 	FINAL_LIBS+=-ldl -pthread -lrt
+	# Add liburing for async I/O support on Linux
+	ifeq ($(uname_S),Linux)
+		FINAL_LIBS+=-luring
+	endif
 endif
 endif
 endif

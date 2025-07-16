@@ -48,6 +48,11 @@ typedef int aeTimeProc(struct aeEventLoop *eventLoop, long long id, void *client
 typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientData);
 typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 
+/* Async I/O callback types */
+typedef void aeAsyncReadProc(int fd, ssize_t nread, void *buf, void *user_data);
+typedef void aeAsyncWriteProc(int fd, ssize_t nwritten, void *user_data);
+typedef void aeAsyncAcceptProc(int fd, int client_fd, void *user_data);
+
 /* File event structure */
 typedef struct aeFileEvent {
     int mask; /* one of AE_(READABLE|WRITABLE|BARRIER) */
@@ -75,6 +80,26 @@ typedef struct aeFiredEvent {
     int mask;
 } aeFiredEvent;
 
+/* Async I/O operation types */
+#define AE_ASYNC_READ 1
+#define AE_ASYNC_WRITE 2
+#define AE_ASYNC_ACCEPT 3
+
+/* Async I/O request structure */
+typedef struct aeAsyncRequest {
+    int type;                    /* AE_ASYNC_READ, AE_ASYNC_WRITE, AE_ASYNC_ACCEPT */
+    int fd;                      /* File descriptor */
+    void *buf;                   /* Buffer for read/write operations */
+    size_t len;                  /* Length for read/write operations */
+    union {
+        aeAsyncReadProc *read_cb;
+        aeAsyncWriteProc *write_cb;
+        aeAsyncAcceptProc *accept_cb;
+    } callback;
+    void *user_data;             /* User data passed to callback */
+    struct aeAsyncRequest *next; /* For linked list management */
+} aeAsyncRequest;
+
 /* State of an event based program */
 typedef struct aeEventLoop {
     int maxfd;   /* highest file descriptor currently registered */
@@ -90,6 +115,11 @@ typedef struct aeEventLoop {
     aeBeforeSleepProc *aftersleep;
     int flags;
     void *privdata[2];
+
+    /* Async I/O support */
+    void *async_data;           /* Platform-specific async I/O data */
+    aeAsyncRequest *async_requests; /* Linked list of outstanding async requests */
+    long long async_request_id; /* Next async request ID */
 } aeEventLoop;
 
 /* Prototypes */
@@ -114,5 +144,14 @@ void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep);
 int aeGetSetSize(aeEventLoop *eventLoop);
 int aeResizeSetSize(aeEventLoop *eventLoop, int setsize);
 void aeSetDontWait(aeEventLoop *eventLoop, int noWait);
+
+/* Async I/O API */
+int aeAsyncRead(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+                aeAsyncReadProc *callback, void *user_data);
+int aeAsyncWrite(aeEventLoop *eventLoop, int fd, void *buf, size_t len,
+                 aeAsyncWriteProc *callback, void *user_data);
+int aeAsyncAccept(aeEventLoop *eventLoop, int fd,
+                  aeAsyncAcceptProc *callback, void *user_data);
+int aeProcessAsyncCompletions(aeEventLoop *eventLoop);
 
 #endif

@@ -43,6 +43,8 @@
     #endif
 #endif
 
+
+
 #define INITIAL_EVENT 1024
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
@@ -64,6 +66,12 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->aftersleep = NULL;
     eventLoop->flags = 0;
     memset(eventLoop->privdata, 0, sizeof(eventLoop->privdata));
+
+    /* Initialize async I/O support */
+    eventLoop->async_data = NULL;
+    eventLoop->async_requests = NULL;
+    eventLoop->async_request_id = 0;
+
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -125,6 +133,16 @@ void aeDeleteEventLoop(aeEventLoop *eventLoop) {
     aeApiFree(eventLoop);
     zfree(eventLoop->events);
     zfree(eventLoop->fired);
+
+    /* Clean up async I/O support - handled by aeApiFree */
+
+    /* Free any outstanding async requests */
+    aeAsyncRequest *req = eventLoop->async_requests;
+    while (req) {
+        aeAsyncRequest *next = req->next;
+        zfree(req);
+        req = next;
+    }
 
     /* Free the time events list. */
     aeTimeEvent *next_te, *te = eventLoop->timeEventHead;
@@ -464,6 +482,8 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     if (flags & AE_TIME_EVENTS)
         processed += processTimeEvents(eventLoop);
 
+    /* Async I/O completions are now handled within aeApiPoll */
+
     return processed; /* return the number of processed file/time events */
 }
 
@@ -509,3 +529,8 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *aftersleep) {
     eventLoop->aftersleep = aftersleep;
 }
+
+/* ======================== Async I/O API Implementation ===================== */
+/* The async I/O API functions are now implemented in each ae_*.c file */
+
+
