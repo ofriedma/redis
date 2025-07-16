@@ -82,6 +82,11 @@
 /* Test for polling API */
 #ifdef __linux__
 #define HAVE_EPOLL 1
+/* Test for io_uring support (Linux 5.1+) */
+#include <sys/syscall.h>
+#if defined(__linux__) && defined(__NR_io_uring_setup)
+#define HAVE_URING 1
+#endif
 #endif
 
 /* Test for accept4() */
